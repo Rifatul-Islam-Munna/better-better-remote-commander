@@ -33,6 +33,7 @@ const explanations:Record<string,string>={
   EDIT_STRUCTURED_FAILED:'structured file edit failed; inspect the tool result and confirm current file state',
   INVALID_ARGUMENT:'tool argument validation failed; check required fields and types',
   FILE_CONFLICT:'expected_sha256 is stale or file changed during publication; re-read current source/hash',
+  STALE_SOURCE_OBSERVATION:'workflow read became stale before mutation; re-read the current source before editing',
   PATH_NOT_ALLOWED:'agent denied the requested file path',
   PATH_CHANGED:'file or junction target changed between validation and lock acquisition; re-check canonical destination',
   TOOL_OUTCOME_UNCERTAIN:'tool did not confirm cancellation or settlement; inspect side effects before retrying',

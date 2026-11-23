@@ -48,6 +48,7 @@ export function failure(err: unknown, callId?: string): ToolResult {
     SEMANTIC_PATH_CHANGED:'The resolved compiler result path changed; recheck the project path and query again.',
     CLAIM_EXPIRED:'Reclaim the task with worker_tasks, re-read current hashes and submit under the new claim. Old keys cannot be reused.',
     FILE_CONFLICT:'The expected_sha256 is stale, or the file changed before commit. No blind retry. Call read_code_file for the current SHA-256 and exact text, then submit a corrected edit after confirming the latest content.',
+    STALE_SOURCE_OBSERVATION:'This workflow previously read the target, but it changed before mutation. Re-read the current source before editing; no mutation started.',
     PATH_CHANGED:'The file/junction resolved to a different location while waiting for a write lock. No tool operation started. Re-check the path and verify its canonical target before any new attempt.',
     SOURCE_HASH_REQUIRED:'Strict source observations are enabled. Read the current source and supply expected_sha256 before editing an existing code/configuration file.',
     TOOL_OUTCOME_UNCERTAIN:'A mutating tool did not confirm that it stopped. Inspect actual effects before repeating work.',

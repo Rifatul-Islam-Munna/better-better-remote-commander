@@ -34,6 +34,13 @@ import {readOnlyCoalescer} from './read-only-coalescer.js';
 import {circuitBreakers} from './circuit-breakers.js';
 import {classifyHeavyCodeModeTask,heavyTaskPolicyStatus} from './heavy-task-policy.js';
 import {systemPressureStatus} from './system-pressure.js';
+import {runProjectPreflight,type ProjectPreflight} from './preflight-self-heal.js';
+import {adaptiveTaskConcurrency} from './task-parallelism.js';
+import {compactModelState} from './model-state-compression.js';
+import {SourceObservationLedger} from './stale-source-guard.js';
+import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} from './recovery-capsule.js';
+import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText} from './adaptive-result-budget.js';
+import {getVerificationEvidence,isTrackedMutation,isVerificationOperation} from './verification-evidence.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
@@ -259,30 +266,28 @@ async function toolReply(result:ToolResult,label:string):Promise<{value:Record<s
   const textContent=content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
   const mediaOmitted=content.some(c=>c.type!=='text');
   const fullValue:Record<string,unknown>={
-    text:textContent,
-    isError:!!result.isError,
-    pending:result.structuredContent?.pending===true,
-    mediaOmitted,
+    text:textContent,isError:!!result.isError,pending:result.structuredContent?.pending===true,mediaOmitted,
     ...(result.structuredContent?{structuredContent:result.structuredContent}:{})
   };
-  const handle=await maybePutResultHandle(fullValue,label).catch(()=>null);
+  const budget=adaptiveToolBudget(label,result);
+  const handle=await maybePutResultHandle(fullValue,label,budget.handleThreshold).catch(()=>null);
+  const projected=projectAdaptiveToolResult(label,result,textContent,!!handle);
   let value:Record<string,unknown>={
-    text:textContent.slice(0,MAX_TOOL_TEXT),
-    isError:!!result.isError,
-    pending:result.structuredContent?.pending===true,
-    mediaOmitted,
-    ...(result.structuredContent?{structuredContent:result.structuredContent}:{}),
+    text:projected.text.slice(0,MAX_TOOL_TEXT),
+    isError:!!result.isError,pending:result.structuredContent?.pending===true,mediaOmitted,
+    ...(projected.structuredContent?{structuredContent:projected.structuredContent}:{}),
+    resultBudget:{textChars:budget.textBudget,handleThreshold:budget.handleThreshold,adaptive:true},
     ...(handle?{resultHandle:handle}:{})
   };
-  let truncated=textContent.length>MAX_TOOL_TEXT;
+  let truncated=!!handle||projected.text.length<textContent.length||textContent.length>MAX_TOOL_TEXT;
   if(limited(value,MAX_TOOL_RESPONSE).length>=MAX_TOOL_RESPONSE){
-    value={text:textContent.slice(0,MAX_SOURCE_OUTPUT),
+    value={text:projected.text.slice(0,MAX_SOURCE_OUTPUT),
       isError:!!result.isError,pending:result.structuredContent?.pending===true,
-      outputTruncated:true,mediaOmitted,
+      outputTruncated:true,mediaOmitted,resultBudget:{textChars:MAX_SOURCE_OUTPUT,adaptive:true},
       ...(handle?{resultHandle:handle}:{}),
       note:handle
-        ?'The full bounded/redacted nested result is retained locally. Query resultHandle inside this Code Mode run instead of returning it through the calling AI.'
-        :'The nested result exceeded the Code Mode limit. Request a smaller range or use the direct tool.'};
+        ?'The full bounded/redacted result is retained locally. Query resultHandle for omitted detail.'
+        :'The result exceeded the Code Mode limit. Request a smaller range.'};
     truncated=true;
   }
   return {value,truncated};
@@ -314,6 +319,14 @@ export async function executeCodeMode(
   let discoveries=0;
   let activeProjectSessionId:string|undefined;
   const projectObservations:Array<{tool:string;args:Args;meta:Record<string,unknown>}>=[];
+  const touchedPaths=new Set<string>();
+  const preflightResults=new Map<string,ProjectPreflight>();
+  const projectKeys=new Set<string>();
+  const verificationResults=new Map<string,Awaited<ReturnType<typeof getVerificationEvidence>>>();
+  const rollbackSnapshotIds=new Set<string>();
+  const sourceLedger=new SourceObservationLedger();
+  let recoveryHint:Awaited<ReturnType<typeof latestRecoveryCapsule>>=null;
+  let recoveryDelivered=false;
   const catalogView=catalog.filter(t=>CODE_MODE_ALLOWED_TOOLS.has(t.name));
   const discoveryCatalog=[...catalogView,...CODE_MODE_VIRTUAL_TOOLS];
   const names=new Map(catalogView.map(t=>[t.name,t]));
@@ -328,6 +341,51 @@ export async function executeCodeMode(
       'Durable Code Mode storage could not initialize: '+(error instanceof Error?error.message.slice(0,400):'unknown local storage error'));
   }
   const {execution,trace,resumed}=durability;
+
+  const rememberPaths=(args:Args)=>{
+    for(const key of ['path','file_path','root','cwd','source','destination','outputPath']){
+      const value=args[key];if(typeof value==='string')touchedPaths.add(value.slice(0,700));
+    }
+    if(Array.isArray(args.paths))for(const value of args.paths)
+      if(typeof value==='string')touchedPaths.add(value.slice(0,700));
+  };
+  const ensurePreflight=async(project:string,intent:'read'|'mutation'|'heavy',tool:string)=>{
+    const preflight=await runProjectPreflight(project,intent);
+    preflightResults.set(project,preflight);
+    await trace.event('project_preflight',{tool,detail:{project,intent,ok:preflight.ok,
+      warnings:preflight.warnings.slice(0,4),healed:preflight.healed.slice(0,4)}});
+    if(intent==='mutation'&&!preflight.safeToMutate)
+      throw new AgentError('PREFLIGHT_BLOCKED','Project mutation preflight failed: '+preflight.warnings.join(' ').slice(0,500),true);
+    if(intent==='heavy'&&!preflight.safeForHeavy)
+      throw new AgentError('PREFLIGHT_BLOCKED','Heavy-task preflight failed: '+preflight.warnings.join(' ').slice(0,500),true);
+    return preflight;
+  };
+  const verificationSummary=()=>[...verificationResults.values()].map(v=>({
+    project:v.project,state:v.state,...('evidenceId' in v&&v.evidenceId?{evidenceId:v.evidenceId}:{}),
+    ...('verifiedAt' in v&&v.verifiedAt?{verifiedAt:v.verifiedAt}:{}),
+    ...('changedSinceVerification' in v?{changedSinceVerification:v.changedSinceVerification}:{}),
+  }));
+  const checkpointRecovery=async(status:RecoveryStatus,activeMutation?:{index:number;tool:string;code?:string})=>{
+    const lastSafe=[...steps].reverse().find(s=>s.outcome==='ok'||s.outcome==='pending');
+    const uncertain=activeMutation??(()=>{
+      const step=[...steps].reverse().find(s=>s.outcome==='uncertain');
+      return step?{index:steps.lastIndexOf(step),tool:step.tool,code:step.errorCode}:undefined;
+    })();
+    return checkpointRecoveryCapsule({
+      id:execution.id,workflowId,executionId:execution.id,status,
+      projects:[...projectKeys],touchedPaths:[...touchedPaths],pendingJobs,
+      ...(lastSafe?{lastSafeStep:{index:steps.lastIndexOf(lastSafe),tool:lastSafe.tool,outcome:lastSafe.outcome}}:{}),
+      ...(uncertain?{uncertainMutation:uncertain}:{}),
+      rollbackSnapshotIds:[...rollbackSnapshotIds],verification:verificationSummary(),
+    });
+  };
+  const modelState=(status:string,outputTruncated=false)=>compactModelState({
+    workflowId,status,steps,pendingJobs,retries:trace.record.retries,
+    replayedSteps:trace.record.replayedSteps,touchedPaths:[...touchedPaths],
+    preflights:[...preflightResults.values()],verification:verificationSummary(),
+    recovery:recoveryHint,sourceObservations:sourceLedger.snapshot(),outputTruncated,
+  });
+  await checkpointRecovery('running').catch(()=>undefined);
 
   const runToolCall=async(name:string,args:Args,role?:string):Promise<RpcReply>=>{
     if(!names.has(name))
@@ -378,10 +436,22 @@ export async function executeCodeMode(
     let autoEscalated=false;
     let escalationReason:string|undefined;
     try{
+      rememberPaths(lifecycle.args);
       projectKey=await inferProjectAffinity(lifecycle.args).catch(()=>undefined);
-      if(projectKey)await schedulerLease.setProject(projectKey,controller.signal);
-
       const escalation=classifyHeavyCodeModeTask(name,lifecycle.args,workflowId);
+      if(projectKey){
+        projectKeys.add(projectKey);
+        if(!recoveryHint)recoveryHint=await latestRecoveryCapsule(projectKey,execution.id).catch(()=>null);
+        if(!verificationResults.has(projectKey))
+          verificationResults.set(projectKey,await getVerificationEvidence(projectKey));
+        await schedulerLease.setProject(projectKey,controller.signal);
+        await ensurePreflight(projectKey,escalation?'heavy':readOnly?'read':'mutation',name);
+        await checkpointRecovery('running').catch(()=>undefined);
+      }
+      if(!readOnly){
+        await sourceLedger.guardMutation(name,lifecycle.args);
+        await checkpointRecovery('running',{index:prepared.index,tool:name}).catch(()=>undefined);
+      }
       autoEscalated=!!escalation;
       escalationReason=escalation?.reason;
       if(escalation)await trace.event('heavy_task_escalated',{tool:name,
@@ -438,12 +508,22 @@ export async function executeCodeMode(
         readOnly,step:prepared.index,
       },response,Date.now()-stepStart,attempts,trace);
       const meta=(response.structuredContent??{}) as Record<string,unknown>;
+      if(!response.isError){
+        if(readOnly)await sourceLedger.recordRead(name,lifecycle.args);
+        else await sourceLedger.refreshMutation(name,lifecycle.args);
+        const rollbackId=meta.rollbackSnapshotId;
+        if(typeof rollbackId==='string')rollbackSnapshotIds.add(rollbackId);
+        if(projectKey&&(isTrackedMutation(name,lifecycle.args)||isVerificationOperation(name,lifecycle.args)))
+          verificationResults.set(projectKey,await getVerificationEvidence(projectKey));
+      }
       const pending=meta.pending===true;
       const error=meta.error as {code?:unknown}|undefined;
       const code=typeof error?.code==='string'?error.code:'TOOL_FAILED';
       const jobId=typeof meta.jobId==='string'?meta.jobId:undefined;
       const status=response.isError?'error':pending?'pending':'ok';
       const {value,truncated}=await toolReply(response,name);
+      if(projectKey&&verificationResults.has(projectKey))value.verificationEvidence=verificationResults.get(projectKey);
+      if(recoveryHint&&!recoveryDelivered){value.recoveryCapsule=recoveryHint;recoveryDelivered=true;}
       const reply:HarnessReply=response.isError
         ?{ok:false,error:{code,message:(typeof value.text==='string'?value.text:'Tool failed.').slice(0,700)}}
         :{ok:true,value};
@@ -456,10 +536,12 @@ export async function executeCodeMode(
       if(pending&&jobId)pendingJobs.push(jobId);
       if(activeProjectSessionId&&projectObservations.length<64)
         projectObservations.push({tool:name,args:lifecycle.args,meta});
+      await checkpointRecovery(pending?'pending':'running').catch(()=>undefined);
       return reply;
     }catch(error){
       const rawCode=typeof (error as {code?:unknown})?.code==='string'?String((error as {code?:unknown}).code):undefined;
-      const knownNoEffect=!!rawCode&&['CIRCUIT_OPEN','CIRCUIT_HALF_OPEN','CODE_MODE_QUEUE_TIMEOUT','CODE_MODE_RELEASED'].includes(rawCode);
+      const knownNoEffect=!!rawCode&&['CIRCUIT_OPEN','CIRCUIT_HALF_OPEN','CODE_MODE_QUEUE_TIMEOUT','CODE_MODE_RELEASED',
+        'STALE_SOURCE_OBSERVATION','PREFLIGHT_BLOCKED'].includes(rawCode);
       const uncertain=controller.signal.aborted||(!readOnly&&!knownNoEffect);
       const code=controller.signal.aborted?'CODE_MODE_OUTCOME_UNCERTAIN':(rawCode??'CODE_MODE_TOOL_FAILED');
       const reply:HarnessReply={ok:false,error:{code,message:error instanceof Error?error.message.slice(0,500):'Nested tool failed.'}};
@@ -470,6 +552,7 @@ export async function executeCodeMode(
         ...(coalesced?{coalesced:true}:{}),...(parked?{parked:true}:{}),
         ...(projectKey?{projectKey}:{}),
         ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),...(role?{role}:{})});
+      await checkpointRecovery(uncertain?'uncertain':'failed').catch(()=>undefined);
       return reply;
     }finally{activeTool=false;}
   };
@@ -526,22 +609,29 @@ export async function executeCodeMode(
       if(calls+safeCalls.length>input.max_calls)
         return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'parallelSafe would exceed the nested tool call budget.'}};
       calls+=safeCalls.length-1; // runToolCall below accounts for the wrapper call.
+      for(const call of safeCalls)if(call.args&&typeof call.args==='object'&&!Array.isArray(call.args))
+        rememberPaths(call.args as Args);
       const firstArgs=safeCalls[0]?.args;
       if(firstArgs&&typeof firstArgs==='object'&&!Array.isArray(firstArgs)){
         const projectKey=await inferProjectAffinity(firstArgs as Record<string,unknown>).catch(()=>undefined);
-        if(projectKey)await schedulerLease.setProject(projectKey,controller.signal);
+        if(projectKey){
+          await schedulerLease.setProject(projectKey,controller.signal);
+          await ensurePreflight(projectKey,'read','parallel_safe');
+        }
       }
-      const pressure=systemPressureStatus();
       const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):3;
-      const maxConcurrency=Math.max(1,Math.min(3,requested,pressure.suggestedSafeParallelism));
+      const adaptive=adaptiveTaskConcurrency(safeCalls,requested);
+      const maxConcurrency=adaptive.effective;
       const reply=await runToolCall('run_parallel',{
         calls:safeCalls,max_concurrency:maxConcurrency,
         timeout_ms:typeof a.timeout_ms==='number'?a.timeout_ms:Math.min(90_000,input.max_runtime_ms),
         output_chars:typeof a.output_chars==='number'?a.output_chars:4_000,
         retain_output:true,
       });
+      if(reply.ok)for(const call of safeCalls)
+        await sourceLedger.recordRead(String(call.tool),call.args as Record<string,unknown>).catch(()=>undefined);
       await trace.event('parallel_safe',{detail:{calls:safeCalls.length,maxConcurrency,
-        pressure:pressure.level,ok:reply.ok}});
+        workloadClasses:adaptive.classes,pressure:adaptive.pressure,ok:reply.ok}});
       return reply;
     }
     if(request.type==='semantic'){
@@ -556,7 +646,9 @@ export async function executeCodeMode(
         const args=request.args as {path?:unknown;query?:unknown;limit?:unknown;refresh?:unknown};
         if(typeof args.path!=='string'||typeof args.query!=='string')
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'semantic search requires path and query strings.'}};
+        rememberPaths({path:args.path});
         await schedulerLease.setProject(args.path,controller.signal);
+        await ensurePreflight(args.path,'read','semantic_project_search');
         const safeArgs={path:args.path,query:args.query,
           limit:typeof args.limit==='number'?args.limit:undefined,refresh:args.refresh===true};
         const joined=await readOnlyCoalescer.run('semantic_project_search',safeArgs,controller.signal,async()=>{
@@ -927,7 +1019,12 @@ export async function executeCodeMode(
       };
       const finishPersisted=(status:'completed'|'failed'|'cancelled'|'uncertain',out:ToolResult,result:unknown)=>{
         if(settled)return;
-        const writes:Promise<unknown>[]=[finishDurableExecution(execution,status,result,trace)];
+        const capsuleStatus:RecoveryStatus=status==='completed'
+          ?(pendingJobs.length?'pending':'completed'):status;
+        const writes:Promise<unknown>[]=[
+          finishDurableExecution(execution,status,result,trace),
+          checkpointRecovery(capsuleStatus),
+        ];
         if(activeProjectSessionId&&projectObservations.length)
           writes.push(observeProjectSessionBatch(activeProjectSessionId,projectObservations));
         void Promise.allSettled(writes).finally(()=>finish(out));
@@ -935,7 +1032,8 @@ export async function executeCodeMode(
       const failureWithSteps=(code:string,message:string)=>{
         const out=blocked(code,message,steps);
         out.structuredContent={...out.structuredContent,workflowId,
-          scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart}};
+          scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
+          modelState:modelState(code==='CODE_MODE_CANCELLED'?'cancelled':'failed')};
         return out;
       };
       const stop=(code:string,message:string)=>{
@@ -962,7 +1060,7 @@ export async function executeCodeMode(
         finishPersisted('failed',out,{code:'CODE_MODE_START_FAILED',message});
         return;
       }
-      worker.on('message',(message:WorkerMessage)=>{
+      worker.on('message',async (message:WorkerMessage)=>{
         if(settled)return;
         if(message?.type==='rpc'){
           void handleRpc(message.request).then(reply=>{
@@ -990,6 +1088,7 @@ export async function executeCodeMode(
                 workflowId,executionId:execution.id,traceId:trace.record.id,resumed,
                 scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
                 retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
+                modelState:modelState('stopped_on_step_error'),
                 automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
               },
             };
@@ -1010,10 +1109,13 @@ export async function executeCodeMode(
           const unawaitedCalls=envelope&&typeof envelope.unawaitedCalls==='number'
             ?Math.max(0,Math.trunc(envelope.unawaitedCalls)):0;
           const fullRendered=limited(resultValue,Number.MAX_SAFE_INTEGER);
-          const outputTruncated=fullRendered.length>MAX_FINAL_RESPONSE;
-          const rendered=outputTruncated
-            ?fullRendered.slice(0,MAX_FINAL_RESPONSE)+'\n[CODE MODE RESULT TRUNCATED: return a smaller summary or use a direct read tool for the omitted data.]'
-            :fullRendered;
+          const finalHandle=await maybePutResultHandle(resultValue,'code_mode_final',18_000).catch(()=>null);
+          const outputTruncated=fullRendered.length>MAX_FINAL_RESPONSE||!!finalHandle;
+          const rendered=finalHandle
+            ?adaptiveFinalText(fullRendered,18_000)+'\n[Full final result retained in local resultHandle '+finalHandle.id+'.]'
+            :outputTruncated
+              ?fullRendered.slice(0,MAX_FINAL_RESPONSE)+'\n[CODE MODE RESULT TRUNCATED: return a smaller summary.]'
+              :fullRendered;
           const pending=pendingJobs.length>0;
           const failedSteps=steps.filter(s=>s.outcome==='error'||s.outcome==='uncertain');
           // A script may catch a failed tool response and continue. Do not
@@ -1029,13 +1131,15 @@ export async function executeCodeMode(
           const out:ToolResult={
             content:[{type:'text',text:summary+'\n'+rendered}],
             structuredContent:{
-              result:outputTruncated?undefined:resultValue,steps,completedCalls:steps.length,
+              result:outputTruncated?undefined:resultValue,...(finalHandle?{resultHandle:finalHandle}:{}),
+              steps,completedCalls:steps.length,
               status,allCallsSucceeded:failedSteps.length===0,
               pending,pendingJobs,executionCompleted:!pending,
               unawaitedCallsDrained:unawaitedCalls,outputTruncated,
               workflowId,executionId:execution.id,traceId:trace.record.id,resumed,
               scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
               retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
+              modelState:modelState(status,outputTruncated),
               storage:{harnessStateMaxBytes:30*1024*1024,semanticCacheMaxBytes:64*1024*1024},
               automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
             },

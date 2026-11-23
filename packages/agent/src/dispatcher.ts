@@ -44,6 +44,12 @@ import {executeToolKernel,attachExecutionOutcome,classifyExecution,trackExecutio
 import {requireSourceObservation,sourceObservationMode,automaticSourcePrecondition} from './runtime/source-observations.js';
 import {compactDuplicatedToolText} from './runtime/result-presentation.js';
 import {invalidateSemanticProject} from './runtime/semantic-project-search.js';
+import {inferProjectAffinity} from './runtime/project-affinity.js';
+import {runProjectPreflight} from './runtime/preflight-self-heal.js';
+import {classifyHeavyCodeModeTask} from './runtime/heavy-task-policy.js';
+import {isTrackedMutation,isVerificationOperation,recordProjectMutation,recordProjectVerification,
+  getVerificationEvidence} from './runtime/verification-evidence.js';
+import {recordMutationChain,linkMutationChainVerification} from './runtime/mutation-chain.js';
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => Promise<unknown>;
@@ -237,6 +243,9 @@ const SEMANTIC_INVALIDATING_MUTATIONS=new Set([
   'write_file','edit_block','delete_file','move_file','create_directory',
   'edit_files','apply_patch','workspace_batch','edit_code_ranges','replace_symbol','worker_integrate'
 ]);
+const PREFLIGHT_MUTATIONS=new Set([
+  ...MUTATIONS,...SEMANTIC_INVALIDATING_MUTATIONS,'git_stage','git_commit','git_push'
+]);
 let readOnlyToolCache:Set<string>|null=null;
 function executionKindForTool(name:string):ExecutionKind{
   if(MUTATIONS.has(name))return 'filesystem_mutation';
@@ -260,6 +269,8 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
     logMode==='mymcp'?mymcpCallPreview(name,args,parent.client,parent.remote):
       logMode==='verbose'?traceToolArguments(name,args):undefined);
   let out:ToolResult;
+  let projectAffinity:string|undefined;
+  let mutationTargets:string[]=[];
   try{
     const handler=TOOL_HANDLERS.get(name);
     args=args??{};
@@ -269,6 +280,17 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
       if(isTermuxRuntime()&&!availableOnTermux(name))throw new AgentError('UNSUPPORTED_ON_TERMUX',
         `${name} needs a desktop/native feature unavailable on Android/Termux (Bionic). Use a supported file, search or terminal tool on this device, or run it on a desktop agent.`);
       await workerCoordinator.guardFileMutation(name,args);
+      projectAffinity=await inferProjectAffinity(args).catch(()=>undefined);
+      if(projectAffinity){
+        const heavy=!!classifyHeavyCodeModeTask(name,args,'direct');
+        if(heavy||PREFLIGHT_MUTATIONS.has(name)){
+          const readiness=await runProjectPreflight(projectAffinity,heavy?'heavy':'mutation');
+          if(heavy&&!readiness.safeForHeavy)
+            throw new AgentError('PREFLIGHT_BLOCKED','Heavy-task preflight failed: '+readiness.warnings.join(' ').slice(0,500),true);
+          if(!heavy&&!readiness.safeToMutate)
+            throw new AgentError('PREFLIGHT_BLOCKED','Mutation preflight failed: '+readiness.warnings.join(' ').slice(0,500),true);
+        }
+      }
     };
     const perform=async()=>{
       checkCancelled();
@@ -312,7 +334,7 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
       return await handler!(args) as ToolResult;
     };
     const kind=executionKindForTool(name);
-    const targets=kind==='filesystem_mutation'
+    mutationTargets=kind==='filesystem_mutation'
       ?[args.file_path,args.path,args.source,args.destination,args.outputPath]
         .filter((p):p is string=>typeof p==='string'&&!!p)
       :[];
@@ -321,7 +343,7 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
       // individual execution a unique receipt identity to avoid collisions.
       // The public MCP callId remains the original parent's ID.
       out=await executeToolKernel({name,callId:parent.id+':'+randomUUID(),kind,
-        paths:targets,preflight,perform,
+        paths:mutationTargets,preflight,perform,
         recordReceipt:MUTATIONS.has(name)||RECEIPT_ONLY_MUTATIONS.has(name)});
     }finally{
       // Invalidate after a failed/uncertain write too. A partial mutation
@@ -334,6 +356,24 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
   }catch(err){out=failure(err,parent.id);}
   const kind=executionKindForTool(name);
   out=attachExecutionOutcome(out,name,parent.id,kind);
+  if(projectAffinity){
+    try{
+      const outcome=classifyExecution(out,kind);
+      let evidence;
+      if(isTrackedMutation(name,args)&&(!out.isError||outcome==='uncertain'))
+        evidence=await recordProjectMutation(projectAffinity,name,args,out.structuredContent as Record<string,unknown>|undefined);
+      else if(isVerificationOperation(name,args)&&!out.isError){
+        evidence=await recordProjectVerification(projectAffinity,name,true);
+        if(evidence.evidenceId)await linkMutationChainVerification(projectAffinity,evidence.evidenceId);
+      }
+      let chain;
+      if(kind!=='read'&&(out._meta as Record<string,unknown>|undefined)?.mutationReceipt)
+        chain=await recordMutationChain({callRef:parent.id,tool:name,project:projectAffinity,targets:mutationTargets,result:out});
+      out={...out,_meta:{...out._meta,verificationEvidence:evidence,
+        ...(chain?{mutationChain:{id:chain.id,previousId:chain.previousId??null,
+          rollbackSnapshotId:chain.rollbackSnapshotId??null,verificationEvidenceId:chain.verificationEvidenceId??null}}:{})}};
+    }catch{/* Evidence/chain telemetry must never change the tool outcome. */}
+  }
   // Only proven duplicate JSON text is shortened; independent file/search
   // output, images and full structured results remain byte-for-byte intact.
   out=compactDuplicatedToolText(out);

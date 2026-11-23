@@ -24,9 +24,10 @@ export const WorkerTasksSchema = z.object({
 }).strict();
 export const WorkerPatchSchema = z.object({ planId: z.string().uuid(), taskId: Id, claimKey: Key, submissionId: Id,
     summary: z.string().min(1).max(4000), changes: z.array(WorkspaceChangeSchema).max(16).default([]) }).strict();
-export const WorkerIntegrateSchema = z.object({ action: z.enum(['preview', 'apply', 'verify', 'finish']).default('preview'),
+export const WorkerIntegrateSchema = z.object({ action: z.enum(['preview', 'apply', 'verify', 'rollback', 'finish']).default('preview'),
     planId: z.string().uuid(), coordinatorKey: Key, taskIds: z.array(Id).min(1).max(32).optional(),
-    review_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(), runChecks: z.boolean().default(false) }).strict();
+    review_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),rollback_id:z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    runChecks: z.boolean().default(false) }).strict();
 export const WORKER_TOOL_HANDLERS: Record<string, (raw: Record<string, unknown>) => Promise<ToolResult>> = {
     worker_tasks: async (raw) => {
         const a = WorkerTasksSchema.parse(raw);
@@ -51,7 +52,7 @@ export function buildWorkerToolDefinitions(): ToolDefinition[] {
         { name: 'worker_patch', schema: WorkerPatchSchema,
             description: 'Submit a claimed task\'s staged UTF-8 patch with exact hashes; writes no shared files. Eligible worktrees should use worker_tasks capture_worktree, which converts the diff to the same staged-patch path and deletes the checkout. Read-only tasks submit findings only; replays are idempotent; 2 MiB/patch.' },
         { name: 'worker_integrate', schema: WorkerIntegrateSchema,
-            description: 'Parent-only preview/apply/verify/finish. Preview returns review_sha256; apply requires it, rechecks hashes and uses guarded workspace_batch. Dependencies unlock after apply. Intermediate waves run a cheap real check; final runChecks/verify uses required checks, and finish requires fresh passing evidence with no unapproved changes. Successful apply replay never repeats edits.' },
+            description: 'Parent preview/apply/verify/rollback/finish. Apply returns a bounded hash-guarded rollbackSnapshotId. rollback refuses changed files or later dependent applied tasks. Final verify/finish requires fresh checks.' },
     ].map(d => ({ name: d.name, description: d.description, inputSchema: zodToJsonSchema(d.schema),
         annotations: { title: d.name, readOnlyHint: false, destructiveHint: d.name === 'worker_integrate' } }));
 }

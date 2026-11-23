@@ -120,12 +120,13 @@ export async function beginMutationReceipt(
 export async function settleMutationReceipt(
   receipt:MutationReceipt|null,paths:string[],outcome:Exclude<MutationOutcome,'started'>,
   errorCode?:string
-):Promise<void>{
-  if(!receipt)return;
+):Promise<MutationReceipt|null>{
+  if(!receipt)return null;
   const updated:MutationReceipt={...receipt,outcome,finishedAt:Date.now(),
     after:await fingerprint(paths),
     ...(errorCode?{errorCode:boundedCode(errorCode)}:{})};
   await writeReceipt(updated);
+  return updated;
 }
 /** On restart, a started receipt can only be classified as uncertain.
  * Displaying an outcome NEVER triggers replay or system mutation. */

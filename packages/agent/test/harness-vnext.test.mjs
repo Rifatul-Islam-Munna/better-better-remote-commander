@@ -28,6 +28,13 @@ const {semanticSearch,semanticSearchStatus}=await import('../dist/runtime/semant
 const {getProjectSession,roundTripAcceleratorStatus}=await import('../dist/runtime/roundtrip-accelerator.js');
 const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
 const {systemPressureStatus}=await import('../dist/runtime/system-pressure.js');
+const {runProjectPreflight}=await import('../dist/runtime/preflight-self-heal.js');
+const {adaptiveTaskConcurrency}=await import('../dist/runtime/task-parallelism.js');
+const {checkpointRecoveryCapsule}=await import('../dist/runtime/recovery-capsule.js');
+const {recordProjectMutation,recordProjectVerification,getVerificationEvidence}=await import('../dist/runtime/verification-evidence.js');
+const {mutationChainStatus}=await import('../dist/runtime/mutation-chain.js');
+const {callTool}=await import('../dist/dispatcher.js');
+const {withCallContext}=await import('../dist/context.js');
 const {executeCodeMode}=await import('../dist/runtime/code-mode.js');
 
 after(async()=>{
@@ -74,7 +81,7 @@ test('semantic project search persists locally, ranks code context, and stays wi
   assert.ok(status.store.bytes<=SEMANTIC_CACHE_BYTES);
 });
 
-test('durable execution replays a settled step without executing it again',async()=>{
+test('durable source reads refresh on resume instead of replaying stale contents',async()=>{
   const source='// durable-replay-test\nreturn 1;';
   const first=await beginDurableExecution(source);
   assert.equal(first.resumed,false);
@@ -85,7 +92,8 @@ test('durable execution replays a settled step without executing it again',async
   const resumed=await beginDurableExecution(source);
   assert.equal(resumed.resumed,true);
   const replay=await durablePrepareStep(resumed.execution,'read_file',{path:'demo.ts'},true,resumed.trace);
-  assert.deepEqual(replay.replay,{ok:true,value:{text:'cached'}});
+  assert.equal(replay.replay,undefined);
+  assert.equal(replay.mustStop,undefined);
   await finishDurableExecution(resumed.execution,'completed',{ok:true},resumed.trace);
 });
 
@@ -363,9 +371,16 @@ test('identical concurrent safe reads coalesce into one underlying execution',as
       return text('shared-value');
     }
   )));
-  assert.equal(calls,1,JSON.stringify(outputs));
+  const runnable=outputs[0]?.structuredContent?.scheduler?.activeLimitAtStart??1;
   assert.ok(outputs.every(x=>x.isError===undefined));
-  assert.ok(outputs.some(x=>x.structuredContent.steps.some(s=>s.coalesced===true)));
+  if(runnable>1){
+    assert.equal(calls,1,JSON.stringify(outputs));
+    assert.ok(outputs.some(x=>x.structuredContent.steps.some(s=>s.coalesced===true)));
+  }else{
+    // Live pressure intentionally serialized the workflows, so there was no
+    // simultaneous in-flight read to coalesce.
+    assert.equal(calls,2);
+  }
 });
 
 test('per-project fairness caps simultaneous work from one repository',async()=>{
@@ -384,7 +399,8 @@ test('per-project fairness caps simultaneous work from one repository',async()=>
   }));
   assert.ok(outputs.every(x=>x.isError===undefined),JSON.stringify(outputs));
   assert.ok(maxRunning<=status.perProjectActiveLimit,{maxRunning,limit:status.perProjectActiveLimit});
-  if(count>status.perProjectActiveLimit)assert.ok(codeModeScheduler.status().fairnessYields>=1);
+  if(status.activeLimit>status.perProjectActiveLimit&&count>status.perProjectActiveLimit)
+    assert.ok(codeModeScheduler.status().fairnessYields>=1);
 });
 
 test('parked wait-heavy workflows free a runnable slot and wake afterward',async()=>{
@@ -525,6 +541,55 @@ test('live system pressure is exposed and scheduler capacity is pressure-aware',
   assert.ok(scheduler.cpu.slots<=scheduler.cpu.baseSlots);
 });
 
+test('Code Mode exposes a compact model-facing state without locally planning tasks',async()=>{
+  const target=path.join(project,'auth.guard.ts');
+  if(!await fs.stat(target).catch(()=>null))await fs.writeFile(target,'export const guard = true;\n');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source='const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'}); return r.text;';
+  const out=await executeCodeMode(args(source,{max_calls:4}),catalog,async()=>text('export const guard = true;'));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  const state=out.structuredContent.modelState;
+  assert.equal(state.version,1);
+  assert.equal(state.status,'completed');
+  assert.equal(state.progress.calls,1);
+  assert.equal(state.tools.find(x=>x.tool==='read_file').calls,1);
+  assert.ok(state.touchedPaths.some(x=>x.endsWith('auth.guard.ts')));
+  assert.ok(state.preflight.some(x=>path.resolve(x.project)===path.resolve(project)));
+  assert.equal('plan' in state,false);
+  assert.equal('tasks' in state,false);
+});
+
+test('preflight self-healing checks readiness but never modifies ordinary project source',async()=>{
+  const file=path.join(project,'preflight-source.ts');
+  await fs.writeFile(file,'export const untouched = 1;\n');
+  const before=await fs.readFile(file,'utf8');
+  const status=await runProjectPreflight(project,'read');
+  assert.equal(status.project,path.resolve(project));
+  assert.equal(status.ok,true);
+  assert.ok(Array.isArray(status.healed));
+  assert.equal(await fs.readFile(file,'utf8'),before);
+  assert.ok(status.diskFreeBytes===undefined||status.diskFreeBytes>=0);
+});
+
+test('task-type parallelism keeps builds serialized and caps mixed/mutation workloads',async()=>{
+  const reads=adaptiveTaskConcurrency([
+    {tool:'read_file',args:{path:'a'}},{tool:'git_status',args:{path:'b'}},{tool:'read_file',args:{path:'c'}},
+  ],3);
+  assert.ok(reads.effective>=1&&reads.effective<=3);
+  const builds=adaptiveTaskConcurrency([
+    {tool:'run_command',args:{command:'pnpm build'}},{tool:'run_project_checks',args:{path:'x'}},
+  ],3);
+  assert.equal(builds.effective,1);
+  const mixed=adaptiveTaskConcurrency([
+    {tool:'run_command',args:{command:'pnpm build'}},{tool:'read_file',args:{path:'x'}},
+  ],3);
+  assert.ok(mixed.effective<=2);
+  const mutations=adaptiveTaskConcurrency([
+    {tool:'write_file',args:{path:'a'}},{tool:'edit_block',args:{file_path:'b'}},{tool:'read_file',args:{path:'c'}},
+  ],3);
+  assert.ok(mutations.effective<=2);
+});
+
 test('round-trip accelerator shares the existing 30 MiB harness quota',async()=>{
   const status=await roundTripAcceleratorStatus();
   assert.equal(status.store.maxBytes,HARNESS_STATE_BYTES);
@@ -541,4 +606,128 @@ test('harness status exposes bounded storage, traces, retries and semantic quota
   assert.ok(status.lifecycleHooks.includes('beforeToolCall'));
   assert.ok(status.specialistAgents.some(x=>x.role==='reviewer'));
   assert.ok(status.store.bytes<=HARNESS_STATE_BYTES);
+});
+
+
+test('Code Mode rejects a mutation when a previously read file changed externally',async()=>{
+  const target=path.join(project,'stale-observation.ts');
+  await fs.writeFile(target,'export const stale = 1;\n');
+  let editExecutions=0;
+  const catalog=[
+    {name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'git_status',description:'status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'edit_block',description:'edit',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const source=[
+    'await tools.call("read_file",{path:'+JSON.stringify(target)+'});',
+    'await tools.call("git_status",{path:'+JSON.stringify(project)+'});',
+    'await tools.call("edit_block",{file_path:'+JSON.stringify(target)+',old_string:"export const stale = 1;",new_string:"export const stale = 3;",expected_replacements:1});',
+    'return "should not reach";',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:8}),catalog,async(name)=>{
+    if(name==='read_file')return text('export const stale = 1;');
+    if(name==='git_status'){
+      await fs.writeFile(target,'export const stale = 2;\n');
+      return text('external modification simulated');
+    }
+    if(name==='edit_block'){editExecutions++;return text('unexpected edit');}
+    throw new Error('unexpected tool '+name);
+  });
+  assert.equal(editExecutions,0);
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.status,'stopped_on_step_error');
+  assert.equal(out.structuredContent.errorCode,'STALE_SOURCE_OBSERVATION');
+  assert.equal(await fs.readFile(target,'utf8'),'export const stale = 2;\n');
+  assert.ok(out.structuredContent.modelState.sourceObservations.staleRejected>=1);
+});
+
+test('next Code Mode workflow receives a compact crash recovery capsule for its project',async()=>{
+  const target=path.join(project,'recovery-target.ts');
+  await fs.writeFile(target,'export const recovery = true;\n');
+  const oldId='recovery-test-'+Date.now();
+  await checkpointRecoveryCapsule({
+    id:oldId,workflowId:'old-workflow',executionId:'old-execution',status:'uncertain',
+    projects:[project],touchedPaths:[target],pendingJobs:['jabcdefg'],
+    lastSafeStep:{index:2,tool:'read_file',outcome:'ok'},
+    uncertainMutation:{index:3,tool:'edit_block',code:'TOOL_OUTCOME_UNCERTAIN'},
+    rollbackSnapshotIds:['a'.repeat(64)],
+    verification:[{project,state:'stale'}],
+  });
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source='const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'}); return r.recoveryCapsule;';
+  const out=await executeCodeMode(args(source,{max_calls:4}),catalog,async()=>text('export const recovery = true;'));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.result.status,'uncertain');
+  assert.equal(out.structuredContent.result.uncertainMutation.tool,'edit_block');
+  assert.deepEqual(out.structuredContent.result.pendingJobs,['jabcdefg']);
+  assert.match(out.structuredContent.result.guidance,/Inspect current effects/);
+  assert.equal(out.structuredContent.modelState.recovery.status,'uncertain');
+});
+
+test('verification evidence becomes stale after an external change to a verified file',async()=>{
+  const target=path.join(project,'verification-evidence.ts');
+  await fs.writeFile(target,'export const verified = 1;\n');
+  await recordProjectMutation(project,'write_file',{path:target});
+  const verified=await recordProjectVerification(project,'verify_project',true);
+  assert.equal(verified.state,'current');
+  assert.ok(verified.evidenceId);
+  await fs.writeFile(target,'export const verified = 2;\n');
+  const stale=await getVerificationEvidence(project);
+  assert.equal(stale.state,'stale');
+  assert.ok(stale.changedSinceVerification.some(x=>path.resolve(x)===path.resolve(target)));
+});
+
+test('adaptive result budgeting keeps large nested and final results behind local handles',async()=>{
+  const target=path.join(project,'adaptive-result.ts');
+  await fs.writeFile(target,'export const small = true;\n');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const nestedSource=[
+    'const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'});',
+    'return {hasHandle:!!r.resultHandle,textLength:r.text.length,adaptive:r.resultBudget&&r.resultBudget.adaptive};',
+  ].join('\n');
+  const nested=await executeCodeMode(args(nestedSource,{max_calls:4}),catalog,async()=>text('line\n'.repeat(18000)));
+  assert.equal(nested.isError,undefined,JSON.stringify(nested));
+  assert.equal(nested.structuredContent.result.hasHandle,true);
+  assert.equal(nested.structuredContent.result.adaptive,true);
+  assert.ok(nested.structuredContent.result.textLength<40000,nested.structuredContent.result.textLength);
+
+  const final=await executeCodeMode(args('return "Z".repeat(30000);',{max_calls:2}),[],async()=>text('unused'));
+  assert.equal(final.isError,undefined,JSON.stringify(final));
+  assert.ok(final.structuredContent.resultHandle);
+  assert.equal(final.structuredContent.result,undefined);
+  assert.equal(final.structuredContent.outputTruncated,true);
+  assert.ok(final.content[0].text.length<22000,final.content[0].text.length);
+});
+
+test('dispatcher mutation receipt chain links before/after hashes to later verification evidence',async()=>{
+  const target=path.join(project,'mutation-chain.ts');
+  await fs.writeFile(target,'export const chain = 1;\n');
+  const edit=await withCallContext({id:'mutation-chain-call-edit',client:null,remote:false},()=>
+    callTool('edit_block',{
+      file_path:target,
+      old_string:'export const chain = 1;',
+      new_string:'export const chain = 2;',
+      expected_replacements:1,
+    }));
+  assert.equal(edit.isError,undefined,JSON.stringify(edit));
+  assert.ok(edit._meta?.mutationReceipt);
+  assert.ok(edit._meta?.mutationChain?.id);
+
+  const verify=await withCallContext({id:'mutation-chain-call-verify',client:null,remote:false},()=>
+    callTool('verify_project',{
+      cwd:project,
+      commands:[{name:'node-ok',program:'node',args:['-e','process.exit(0)']}],
+      timeout_ms:10000,
+      stopOnFailure:true,
+    }));
+  assert.notEqual(verify.isError,true,JSON.stringify(verify));
+  assert.equal(verify.structuredContent.passed,true);
+
+  const chain=await mutationChainStatus(project);
+  const row=chain.recent.find(x=>x.tool==='edit_block'&&x.targets.some(t=>t.label.endsWith('mutation-chain.ts')));
+  assert.ok(row,JSON.stringify(chain));
+  assert.ok(row.targets[0].before);
+  assert.ok(row.targets[0].after);
+  assert.notEqual(row.targets[0].before,row.targets[0].after);
+  assert.ok(row.verificationEvidenceId,JSON.stringify(row));
 });

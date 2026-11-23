@@ -14,6 +14,8 @@ import {workerPlanCheckpointsEnabled,saveWorkerPlanCheckpoint,loadWorkerPlanChec
   type WorkerPlanCheckpoint} from './worker-plan-checkpoints.js';
 import {assessWorkerWorktrees,createWriterWorktree,captureWriterWorktree,cleanupWriterWorktree,
   cleanupPlanWorktrees,workerWorktreeStatus,type WorktreeLease} from './worker-worktrees.js';
+import {prepareWorkerRollbackSnapshot,finalizeWorkerRollbackSnapshot,getWorkerRollbackSnapshot,rollbackWorkerSnapshot,
+  deleteWorkerRollbackSnapshot,deletePlanRollbackSnapshots} from './worker-rollbacks.js';
 export const WORKER_LIMITS = Object.freeze({ plans: 4, tasks: 32, maxWorkers: 10, defaultWorkers: 3, receipts: 64, appliedPaths: 512,
     patchBytes: 2 * 1024 * 1024, planPatchBytes: 8 * 1024 * 1024, totalPatchBytes: 16 * 1024 * 1024,
     idleMs: 2 * 3600000, terminalMs: 5 * 60000, leaseMs: 15 * 60000 });
@@ -102,6 +104,7 @@ interface Plan {
         changedPaths:string[];
         steps:unknown[];
     };
+    lastRollbackSnapshotId?:string;
     worktreeIsolation:{
         enabled:boolean;
         reason:string;
@@ -284,7 +287,7 @@ export class WorkerCoordinator {
             cancelledTasks:[...this.plans.values()].reduce((n,p)=>n+[...p.tasks.values()].filter(t=>t.state==='cancelled').length,0),
             spawnedModels: 0, note: 'Opt-in checkpointing stores metadata and coordinator-key verifiers only; never claim keys, worktrees or patch contents. Payload budgets are not an OS-enforced RSS limit.' };
     }
-    clear() { for(const p of this.plans.values())void cleanupPlanWorktrees(p.root,p.id);this.plans.clear(); this.creating.clear(); this.pendingBytes.clear(); }
+    clear() { for(const p of this.plans.values()){void cleanupPlanWorktrees(p.root,p.id);void deletePlanRollbackSnapshots(p.id);}this.plans.clear(); this.creating.clear(); this.pendingBytes.clear(); }
     private async get(id: string): Promise<Plan> {
         await this.loadSavedPlans();
         this.prune();
@@ -372,6 +375,7 @@ export class WorkerCoordinator {
                 queued:liveTasks.filter(t=>t.state==='queued').length,claimed:liveTasks.filter(t=>t.state==='claimed').length,
                 submitted:liveTasks.filter(t=>t.state==='submitted').length,applied:liveTasks.filter(t=>t.state==='applied').length},
             requiredChecks: p.requiredChecks,incrementalVerification:p.incrementalVerification,
+            lastRollbackSnapshotId:p.lastRollbackSnapshotId??null,
             worktreeIsolation:p.worktreeIsolation,
             verification: p.verification, verificationFreshness: 'Use worker_integrate finish to recheck current files; status alone does not validate fresh source.',
             persistent: !!p.persisted, restored:!!p.restored, resumeRequired:!!p.resumeRequired,
@@ -536,6 +540,7 @@ export class WorkerCoordinator {
             p.verification = undefined;
             p.incrementalVerification=undefined;
             await cleanupPlanWorktrees(p.root,p.id);
+            await deletePlanRollbackSnapshots(p.id);
             p.baseline.clear();
             p.appliedHashes.clear();
             p.receipts.clear();
@@ -842,18 +847,22 @@ export class WorkerCoordinator {
         return { ...data, passed, coverage: after.coverage };
     }
     async integrate(a: {
-        action: 'preview' | 'apply' | 'verify' | 'finish';
+        action: 'preview' | 'apply' | 'verify' | 'rollback' | 'finish';
         planId: string;
         coordinatorKey: string;
         taskIds?: string[];
         review_sha256?: string;
+        rollback_id?: string;
         runChecks?: boolean;
     }): Promise<ToolResult> {
         const p = await this.get(a.planId);
         authorize(a.coordinatorKey, p.coordinatorHash);
         if (a.action === 'apply' && a.review_sha256 && p.receipts.has(a.review_sha256))
             return result({ ...p.receipts.get(a.review_sha256), replay: true, note: 'This integration already committed; no file or command was executed again. Use verify/finish for current evidence.' });
-        if (!(a.action === 'finish' && p.state === 'finished'))
+        if (a.action==='rollback') {
+            if(!['active','needs_review','finished'].includes(p.state))
+                throw new AgentError('WORKER_PLAN_CLOSED',`Plan is ${p.state}; rollback is unavailable after cancellation.`);
+        } else if (!(a.action === 'finish' && p.state === 'finished'))
             this.editable(p);
         if (p.busy)
             throw new AgentError('WORKER_PLAN_BUSY', 'Another integration is running.', true);
@@ -862,7 +871,44 @@ export class WorkerCoordinator {
         p.busy = true;
         const beforeRevision=p.revision,beforeState=p.state;
         let committed = false, mutationStarted = false;
+        let rollbackSnapshotId:string|undefined;
         try {
+            if(a.action==='rollback'){
+                if(!a.rollback_id)throw new AgentError('ROLLBACK_ID_REQUIRED','rollback requires rollback_id from a committed integration receipt.');
+                const snapshot=await getWorkerRollbackSnapshot(a.rollback_id);
+                if(!snapshot||snapshot.planId!==p.id)
+                    throw new AgentError('ROLLBACK_NOT_FOUND','Rollback snapshot is unavailable for this plan.');
+                const roots=new Set(snapshot.taskIds);
+                const blockers=[...p.tasks.values()].filter(t=>t.state==='applied'&&!roots.has(t.id)&&
+                    [...taskAncestors(p.tasks,t.id)].some(id=>roots.has(id))).map(t=>t.id);
+                if(blockers.length)throw new AgentError('ROLLBACK_DEPENDENTS_APPLIED',
+                    'Rollback would invalidate later applied dependent tasks: '+blockers.slice(0,8).join(', ')+'. Roll back/rework downstream tasks first.');
+                mutationStarted=true;
+                const rolled=await rollbackWorkerSnapshot(p.root,p.id,a.rollback_id);
+                committed=true;
+                for(const f of rolled.snapshot.files){
+                    const key=fileId(f.relative);
+                    if(f.beforeSha256===null||p.baseline.get(key)===f.beforeSha256)p.appliedHashes.delete(key);
+                    else p.appliedHashes.set(key,f.beforeSha256);
+                }
+                for(const id of rolled.snapshot.taskIds){
+                    const t=p.tasks.get(id);if(!t||t.state!=='applied')continue;
+                    t.state='queued';t.submission=undefined;t.claimHash=undefined;t.worker=undefined;t.expiresAt=undefined;
+                    t.generation++;t.note='Integration wave rolled back; reclaim and re-read fresh source before resubmitting.';
+                }
+                for(const id of rolled.snapshot.autoCancelledTaskIds){
+                    const t=p.tasks.get(id);if(!t||t.state!=='cancelled')continue;
+                    t.state='queued';t.generation++;t.note='Restored because the superseding integration wave was rolled back.';
+                }
+                for(const [key,receipt] of [...p.receipts.entries()])if(receipt.rollbackSnapshotId===a.rollback_id){
+                    p.receiptBytes-=Buffer.byteLength(JSON.stringify(receipt));p.receipts.delete(key);
+                }
+                p.state='active';p.verification=undefined;p.incrementalVerification=undefined;
+                p.lastRollbackSnapshotId=a.rollback_id;p.revision++;
+                return result({planId:p.id,rolledBack:true,replay:rolled.replay,rollbackSnapshotId:a.rollback_id,
+                    restoredTaskIds:rolled.snapshot.taskIds,restoredObsoleteTaskIds:rolled.snapshot.autoCancelledTaskIds,
+                    files:rolled.files,note:'Rollback restored the exact pre-wave file state. Reclaim affected tasks before new work.'});
+            }
             if (a.action === 'finish') {
                 if ([...p.tasks.values()].some(t => t.state !== 'applied' && t.state !== 'cancelled'))
                     throw new AgentError('TASKS_INCOMPLETE', 'Some non-obsolete tasks are not applied.');
@@ -928,10 +974,17 @@ export class WorkerCoordinator {
                 return result({ planId: p.id, review_sha256: digest, taskIds: selected.map(t => t.id), dryRun: true, validation: validation.structuredContent,
                     previews, previewsTruncated: budget <= 0, writesPerformed: 0, note: 'Review these proposals. apply revalidates every hash and commits this exact selected set; no automatic merge or execution.' });
             }
+            const rollbackSnapshot=changes.length?await prepareWorkerRollbackSnapshot({
+                root:p.root,planId:p.id,taskIds:selected.map(t=>t.id),changes,
+            }):null;
+            rollbackSnapshotId=rollbackSnapshot?.id;
+            if(rollbackSnapshotId)p.lastRollbackSnapshotId=rollbackSnapshotId;
             checkCancelled();
             mutationStarted = true;
             const outcome = changes.length ? await workspaceBatch({ path: p.root, changes, dryRun: false, writeConcurrency: 4 }) : result({ changes: [] });
             if (outcome.isError) {
+                if(rollbackSnapshotId)await deleteWorkerRollbackSnapshot(rollbackSnapshotId);
+                rollbackSnapshotId=undefined;
                 if (outcome.structuredContent?.requiresReview)
                     p.state = 'needs_review';
                 return { ...outcome, structuredContent: { ...outcome.structuredContent, planId: p.id, committed: false, planState: p.state } };
@@ -960,12 +1013,14 @@ export class WorkerCoordinator {
                 const cancelled=await this.cancelTasks(p,t.supersedes,`Superseded by applied task ${t.id}.`);
                 autoCancelled.push(...cancelled.cancelled);
             }
+            if(rollbackSnapshotId)await finalizeWorkerRollbackSnapshot(rollbackSnapshotId,autoCancelled);
             p.verification = undefined;
             p.incrementalVerification=undefined;
             p.revision++;
             const receipt: Record<string, unknown> = { planId: p.id, review_sha256: digest, appliedTaskIds: selected.map(t => t.id),
                 autoCancelledObsoleteTaskIds:[...new Set(autoCancelled)],committed: true,
-                changes: written, replay: false, persistent: false, note: 'Patches applied. Obsolete superseded branches were cancelled. A failing check does not undo code; never blindly resubmit an already committed integration.' };
+                ...(rollbackSnapshotId?{rollbackSnapshotId}:{}),
+                changes: written, replay: false, persistent: false, note: 'Patches applied with a hash-guarded rollback snapshot when files changed. Obsolete superseded branches were cancelled. Never blindly resubmit an already committed integration.' };
             p.receipts.set(digest, receipt);
             p.receiptBytes += Buffer.byteLength(JSON.stringify(receipt));
             while (p.receipts.size > WORKER_LIMITS.receipts) {
@@ -984,6 +1039,7 @@ export class WorkerCoordinator {
             return result(receipt);
         }
         catch (error) {
+            if(rollbackSnapshotId&&!committed)await deleteWorkerRollbackSnapshot(rollbackSnapshotId);
             if (mutationStarted && !committed && !(error instanceof AgentError && ['FILE_CONFLICT', 'EDIT_MISMATCH', 'FILE_TOO_LARGE', 'BATCH_TOO_LARGE', 'DUPLICATE_TARGET', 'UNSAFE_TARGET', 'OUTSIDE_PROJECT'].includes(error.code)))
                 p.state = 'needs_review';
             const out = failure(error);

@@ -97,8 +97,12 @@ export async function executeToolKernel(options:ExecutionOptions):Promise<ToolRe
       const outcome=classifyExecution(result,options.kind);
       const receiptOutcome=outcome==='uncertain'||outcome==='pending'
         ?'uncertain':outcome==='failed'?'reported_failure':'returned_success';
-      await settleMutationReceipt(receipt,canonicalPaths,receiptOutcome,codeFrom(result));
-      return result;
+      const settledReceipt=await settleMutationReceipt(receipt,canonicalPaths,receiptOutcome,codeFrom(result));
+      return settledReceipt?{...result,_meta:{...result._meta,mutationReceipt:{
+        id:settledReceipt.id,tool:settledReceipt.tool,outcome:settledReceipt.outcome,
+        targets:settledReceipt.targets,before:settledReceipt.before??[],after:settledReceipt.after??[],
+        at:settledReceipt.at,finishedAt:settledReceipt.finishedAt,
+      }}}:result;
     }catch(error){
       await settleMutationReceipt(receipt,canonicalPaths,'uncertain',
         (error as {code?:string})?.code??'UNEXPECTED_EXCEPTION');

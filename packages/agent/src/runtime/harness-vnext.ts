@@ -29,6 +29,7 @@ const MUTATING_TOOLS=new Set([
   'write_pdf','workspace_batch','replace_symbol','edit_code_ranges','worker_patch','worker_integrate',
   'git_stage','git_commit','git_push','call_plugin_tool',
 ]);
+const FRESH_SOURCE_READS=new Set(['read_file','read_code_file','read_multiple_files','read_code_ranges']);
 
 export type HarnessReply={ok:boolean;value?:unknown;error?:{code:string;message:string}};
 export type DurableStepState='started'|'settled'|'error'|'uncertain';
@@ -234,6 +235,10 @@ export async function durablePrepareStep(
       await trace.event('durable_divergence',{tool,detail:{index}});
       return {index,mustStop:{ok:false,error:{code:'DURABLE_REPLAY_DIVERGED',
         message:'Resumed workflow diverged from its durable call sequence. Start a fresh Code Mode workflow instead of replaying mutations.'}}};
+    }
+    if(existing.state==='settled'&&existing.readOnly&&FRESH_SOURCE_READS.has(tool)){
+      await trace.event('durable_refresh_source_read',{tool,detail:{index}});
+      return {index};
     }
     if(existing.state==='settled'&&existing.reply){
       await trace.replay(tool,index);

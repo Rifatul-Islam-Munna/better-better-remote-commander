@@ -348,3 +348,97 @@ test('persistent cleanup registry removes a simulated crash-leftover worktree',a
  assert.equal(await fs.stat(path.join(root,'.brc-worker-worktrees')).catch(()=>null),null);
  ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
 });
+
+
+test('integration wave rollback snapshot restores exact previous files and requeues the task',async()=>{
+ const root=await fixture(),original=await fs.readFile(path.join(root,'src/a.cs'),'utf8');
+ const p=await create(root,[task('a',['src/a.cs'])]);
+ await submitOne(p,root,'a','src/a.cs','public class RollbackCandidate {}\n');
+ const preview=ok(await integrate(p,'preview'));
+ const applied=ok(await integrate(p,'apply',{review_sha256:preview.review_sha256}));
+ assert.match(applied.rollbackSnapshotId,/^[a-f0-9]{64}$/);
+ assert.match(await fs.readFile(path.join(root,'src/a.cs'),'utf8'),/RollbackCandidate/);
+ const rolled=ok(await integrate(p,'rollback',{rollback_id:applied.rollbackSnapshotId}));
+ assert.equal(rolled.rolledBack,true);
+ assert.equal(await fs.readFile(path.join(root,'src/a.cs'),'utf8'),original);
+ const status=ok(await callTool('worker_tasks',{action:'status',planId:p.planId}));
+ assert.equal(status.tasks.find(t=>t.id==='a').state,'queued');
+ assert.equal(status.lastRollbackSnapshotId,applied.rollbackSnapshotId);
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('rollback snapshot removes files that were newly created by the integration wave',async()=>{
+ const root=await fixture(),p=await create(root,[task('new',['src/new-file.ts'])]);
+ const lease=await claim(p,'new');
+ ok(await patch(p,'new',lease,[{path:'src/new-file.ts',expected_sha256:null,content:'export const created = true;\n'}]));
+ const preview=ok(await integrate(p,'preview'));
+ const applied=ok(await integrate(p,'apply',{review_sha256:preview.review_sha256}));
+ assert.ok(await fs.stat(path.join(root,'src/new-file.ts')));
+ ok(await integrate(p,'rollback',{rollback_id:applied.rollbackSnapshotId}));
+ assert.equal(await fs.stat(path.join(root,'src/new-file.ts')).catch(()=>null),null);
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('rollback refuses to overwrite newer external edits',async()=>{
+ const root=await fixture(),p=await create(root,[task('a',['src/a.cs'])]);
+ await submitOne(p,root,'a','src/a.cs','public class AppliedWave {}\n');
+ const preview=ok(await integrate(p,'preview'));
+ const applied=ok(await integrate(p,'apply',{review_sha256:preview.review_sha256}));
+ await fs.writeFile(path.join(root,'src/a.cs'),'public class NewerExternalEdit {}\n');
+ bad(await integrate(p,'rollback',{rollback_id:applied.rollbackSnapshotId}),'ROLLBACK_CONFLICT');
+ assert.equal(await fs.readFile(path.join(root,'src/a.cs'),'utf8'),'public class NewerExternalEdit {}\n');
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('rollback refuses an earlier wave after a dependent task was applied',async()=>{
+ const root=await fixture();
+ const p=await create(root,[task('first',['src/a.cs']),task('second',['src/b.rs'],['first'])]);
+ await submitOne(p,root,'first','src/a.cs','public class FirstWave {}\n');
+ const firstPreview=ok(await integrate(p,'preview',{taskIds:['first']}));
+ const firstApplied=ok(await integrate(p,'apply',{taskIds:['first'],review_sha256:firstPreview.review_sha256}));
+ const second=await claim(p,'second');
+ ok(await patch(p,'second',second,[await replacement(root,'src/b.rs','pub fn dependent_wave() {}\n')]));
+ const secondPreview=ok(await integrate(p,'preview',{taskIds:['second']}));
+ ok(await integrate(p,'apply',{taskIds:['second'],review_sha256:secondPreview.review_sha256}));
+ bad(await integrate(p,'rollback',{rollback_id:firstApplied.rollbackSnapshotId}),'ROLLBACK_DEPENDENTS_APPLIED');
+ assert.match(await fs.readFile(path.join(root,'src/a.cs'),'utf8'),/FirstWave/);
+ assert.match(await fs.readFile(path.join(root,'src/b.rs'),'utf8'),/dependent_wave/);
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('rolling back a superseding wave revives the obsolete branch it cancelled',async()=>{
+ const root=await fixture();
+ const p=await create(root,[
+   {...task('winner',['src/a.cs']),supersedes:['loser']},
+   task('loser',['src/b.rs']),
+ ]);
+ const loser=await claim(p,'loser');
+ ok(await patch(p,'loser',loser,[await replacement(root,'src/b.rs','pub fn alternate() {}\n')]));
+ const winner=await claim(p,'winner');
+ ok(await patch(p,'winner',winner,[await replacement(root,'src/a.cs','public class WinningWave {}\n')]));
+ const preview=ok(await integrate(p,'preview',{taskIds:['winner']}));
+ const applied=ok(await integrate(p,'apply',{taskIds:['winner'],review_sha256:preview.review_sha256}));
+ assert.deepEqual(applied.autoCancelledObsoleteTaskIds,['loser']);
+ ok(await integrate(p,'rollback',{rollback_id:applied.rollbackSnapshotId}));
+ const status=ok(await callTool('worker_tasks',{action:'status',planId:p.planId}));
+ assert.equal(status.tasks.find(t=>t.id==='winner').state,'queued');
+ assert.equal(status.tasks.find(t=>t.id==='loser').state,'queued');
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+
+test('finished plan keeps its bounded rollback snapshot and can safely reopen through rollback',async()=>{
+ const root=await fixture(),original=await fs.readFile(path.join(root,'src/a.cs'),'utf8');
+ const p=await create(root,[task('a',['src/a.cs'])]);
+ await submitOne(p,root,'a','src/a.cs','public class FinishedThenRolledBack {}\n');
+ const preview=ok(await integrate(p,'preview'));
+ const applied=ok(await integrate(p,'apply',{review_sha256:preview.review_sha256,runChecks:true}));
+ ok(await integrate(p,'finish'));
+ const rolled=ok(await integrate(p,'rollback',{rollback_id:applied.rollbackSnapshotId}));
+ assert.equal(rolled.rolledBack,true);
+ assert.equal(await fs.readFile(path.join(root,'src/a.cs'),'utf8'),original);
+ const status=ok(await callTool('worker_tasks',{action:'status',planId:p.planId}));
+ assert.equal(status.state,'active');
+ assert.equal(status.tasks.find(t=>t.id==='a').state,'queued');
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});

@@ -37,6 +37,7 @@ import { saveJobOutput,readJobOutput,redactJobOutput,spillEnabled,type SpillRef 
 import {classifyExecution} from '../runtime/execution-kernel.js';
 import {AgentError,failure} from '../runtime/errors.js';
 import {linkCallJobs} from '../runtime/call-outcomes.js';
+import {adaptiveTaskConcurrency} from '../runtime/task-parallelism.js';
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -1007,11 +1008,12 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
       `The batch would exceed the ${MAX_QUEUED_JOBS}-job queue; no calls were started.`,
       'Wait for existing jobs to finish and inspect list_jobs before submitting another batch.',
       {tool:'list_jobs',args:{limit:50}});
+  const adaptive=adaptiveTaskConcurrency(a.calls,a.max_concurrency);
   const group = `par-${Date.now().toString(36)}${randomBytes(3).toString('hex')}`;
   const batch = a.calls.map((c, i) => createJob([c], {
     label: c.label ?? `#${i + 1} ${stepName(c)}`,
     group,
-    groupConcurrency: a.max_concurrency,
+    groupConcurrency: adaptive.effective,
     retainOutput:a.retain_output,
   }));
   // Resolve dependency IDs after all jobs exist; indices were validated above.
@@ -1030,7 +1032,7 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
 
   const finished = batch.filter(isFinished);
   const failed = finished.filter((j) => j.status !== 'succeeded');
-  let s = `run_parallel: ${finished.length}/${batch.length} done${failed.length ? `, ${failed.length} failed` : ''}.`;
+  let s = `run_parallel: ${finished.length}/${batch.length} done${failed.length ? `, ${failed.length} failed` : ''}. concurrency=${adaptive.effective}/${adaptive.requested} pressure=${adaptive.pressure}.`;
   let shown=0;
   for (const j of batch) {
     const r=j.results[0];
@@ -1047,6 +1049,8 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
   if (finished.length < batch.length) s += `\n\nUnfinished calls keep running. Collect them with wait_jobs({"group":"${group}"}).`;
   return {content:[{type:'text',text:capJobReply(s)}],structuredContent:{group,jobIds:batch.map(j=>j.id),
     dependencies:a.calls.map(c=>c.depends_on),finished:finished.length,total:batch.length,
+    requestedConcurrency:adaptive.requested,effectiveConcurrency:adaptive.effective,
+    workloadClasses:adaptive.classes,pressure:adaptive.pressure,
     failed:failed.length,failedJobIds:failed.map(j=>j.id),
     executionCompleted:finished.length===batch.length,
     allCallsSucceeded:finished.length===batch.length&&failed.length===0,

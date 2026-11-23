@@ -177,6 +177,7 @@ test('guest return payload is bounded without failing the completed workflow',as
  assert.equal(out.isError,undefined,JSON.stringify(out));
  assert.equal(out.structuredContent.outputTruncated,true);
  assert.equal(out.structuredContent.result,undefined);
- assert.match(out.content[0].text,/RESULT TRUNCATED/);
- assert.ok(out.content[0].text.length<52000);
+ assert.ok(out.structuredContent.resultHandle);
+ assert.match(out.content[0].text,/Full final result retained in local resultHandle/);
+ assert.ok(out.content[0].text.length<22000);
 });

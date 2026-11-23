@@ -237,6 +237,11 @@ export async function cleanupRegisteredWorkerWorktrees(){
  }
 }
 const startupCleanup=cleanupRegisteredWorkerWorktrees().catch(()=>{});
+export async function healWorkerWorktreeMetadata(root:string){
+ await startupCleanup;
+ await cleanupBaseIfEmpty(root);
+ return {healed:true};
+}
 export function workerWorktreeStatus(){
  return {created,cleaned,captured,orphanSweeps,cleanupFailures,rootName:ROOT_NAME,cleanupRegistryMaxBytes:1024*1024,
   policy:'Only clean Git projects with 2+ independent writer tasks use temporary linked worktrees. Worktrees are removed after capture/release/cancel/expiry/finish; a bounded registry also removes crash leftovers on the next agent process startup.'};

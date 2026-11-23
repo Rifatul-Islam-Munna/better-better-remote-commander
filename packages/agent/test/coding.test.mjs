@@ -49,6 +49,21 @@ test('multi-file exact edits preserve BOM/CRLF and reject stale hashes',async()=
  assert.equal(await read(a),'\ufeffconst count=3;\r\n');assert.equal(await read(b),'const count=4;\n');
  const r=await callTool('edit_files',{files:[edit(a,aa,'bad')]});assert.equal(r.structuredContent.error.code,'FILE_CONFLICT');assert.equal(await read(a),'\ufeffconst count=3;\r\n');
 });
+test('stale edit_files hashes safely rebase exact anchors and recognize already-applied retries',async()=>{
+ const p=file('rebase.txt'),original='const one = 1;\nconst untouched = true;\n';
+ await fs.writeFile(p,original);
+ await fs.appendFile(p,'// unrelated external change\n');
+ const stale=await callTool('edit_files',{files:[{path:p,expected_sha256:sha256(original),edits:[{old_string:'const one = 1;',new_string:'const one = 2;',expected_replacements:1}]}]});
+ const first=ok(stale).files[0];
+ assert.equal(first.safelyRebasedFromStaleHash,true);
+ assert.equal(first.alreadyApplied,false);
+ const afterFirst=await read(p);
+ assert.match(afterFirst,/const one = 2;/);
+ const retry=await callTool('edit_files',{files:[{path:p,expected_sha256:sha256(original),edits:[{old_string:'const one = 1;',new_string:'const one = 2;',expected_replacements:1}]}]});
+ const second=ok(retry).files[0];
+ assert.equal(second.alreadyApplied,true);
+ assert.equal(await read(p),afterFirst);
+});
 test('mismatch, duplicate targets and dry run never partially apply',async()=>{
  const a=file('dry-a.txt'),b=file('dry-b.txt');await fs.writeFile(a,'a');await fs.writeFile(b,'b');
  const wrong={...edit(b,'b','new-b'),edits:[{old_string:'missing',new_string:'x'}]};

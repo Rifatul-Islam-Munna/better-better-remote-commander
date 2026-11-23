@@ -141,7 +141,7 @@ async function editFiles(raw:unknown):Promise<ToolResult> {
   const keys=await Promise.all(paths.map(lockKey));
   if(new Set(keys).size!==keys.length)throw new AgentError('DUPLICATE_TARGET','Only one edit entry per canonical file is allowed.');
   return withFileLocks(paths,async()=>{
-    const prepared:{path:string;before:Buffer;after:Buffer;beforeHash:string;afterHash:string}[]=[];
+    const prepared:{path:string;before:Buffer;after:Buffer;beforeHash:string;afterHash:string;safelyRebased:boolean;alreadyApplied:boolean}[]=[];
     let bytesTotal=0;
     for(let i=0;i<a.files.length;i++){
       checkCancelled();
@@ -149,22 +149,42 @@ async function editFiles(raw:unknown):Promise<ToolResult> {
       bytesTotal+=before.length;
       if(bytesTotal>16*1024*1024)throw new AgentError('BATCH_TOO_LARGE','Combined edit inputs exceed 16 MiB.');
       const beforeHash=sha256(before);
-      if(beforeHash!==f.expected_sha256.toLowerCase())throw new AgentError('FILE_CONFLICT',`File ${i+1} changed. No files were written.`);
       let content=decodeCode(before);
       const crlf=content.includes('\r\n');
       const normalize=(s:string)=>crlf?s.replace(/\r?\n/g,'\r\n'):s;
+      const staleHash=beforeHash!==f.expected_sha256.toLowerCase();
+      let safelyRebased=false;
+      let alreadyApplied=true;
       for(const e of f.edits){
-        const old=normalize(e.old_string),parts=content.split(old),count=parts.length-1;
-        if(count!==e.expected_replacements)throw new AgentError('EDIT_MISMATCH',`File ${i+1}: expected ${e.expected_replacements} matches, found ${count}. No files were written.`);
-        content=parts.join(normalize(e.new_string));
+        const old=normalize(e.old_string),next=normalize(e.new_string);
+        const parts=content.split(old),count=parts.length-1;
+        if(count===e.expected_replacements){
+          content=parts.join(next);
+          alreadyApplied=false;
+          if(staleHash)safelyRebased=true;
+        }else if(count===0){
+          const nextCount=content.split(next).length-1;
+          if(nextCount!==e.expected_replacements)
+            throw new AgentError(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
+              `File ${i+1}: source changed and the exact edit cannot be proven safe (expected ${e.expected_replacements} old matches, found 0; replacement matches ${nextCount}). No files were written.`);
+        }else{
+          throw new AgentError(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
+            `File ${i+1}: expected ${e.expected_replacements} matches, found ${count}. No files were written.`);
+        }
         if(Buffer.byteLength(content)>8*1024*1024)throw new AgentError('FILE_TOO_LARGE','Edited file would exceed 8 MiB.');
       }
       const after=Buffer.from(content,'utf8');
-      prepared.push({path:paths[i],before,after,beforeHash,afterHash:sha256(after)});
+      prepared.push({path:paths[i],before,after,beforeHash,afterHash:sha256(after),
+        safelyRebased,alreadyApplied});
     }
     const committed:typeof prepared=[];
     try {
-      if(!a.dryRun)for(const f of prepared){checkCancelled();await atomicWrite(f.path,f.after,f.beforeHash);committed.push(f);projectIndex.invalidate(f.path);codeGraph.invalidate(f.path);}
+      if(!a.dryRun)for(const f of prepared){
+        checkCancelled();
+        if(f.alreadyApplied)continue;
+        await atomicWrite(f.path,f.after,f.beforeHash);
+        committed.push(f);projectIndex.invalidate(f.path);codeGraph.invalidate(f.path);
+      }
     }catch(err){
       const rollbackConflicts:string[]=[];
       for(const f of committed.reverse()){
@@ -177,9 +197,10 @@ async function editFiles(raw:unknown):Promise<ToolResult> {
       return out;
     }
     return result({dryRun:a.dryRun,files:prepared.map((f,i)=>({path:f.path,beforeSha256:f.beforeHash,afterSha256:f.afterHash,changed:f.beforeHash!==f.afterHash,
+      safelyRebasedFromStaleHash:f.safelyRebased,alreadyApplied:f.alreadyApplied,
       hunks:a.files[i].edits.map((e,index)=>({index,expectedReplacements:e.expected_replacements,
         beforePreview:e.old_string.slice(0,240),afterPreview:e.new_string.slice(0,240),
-        truncated:e.old_string.length>240||e.new_string.length>240}))})),atomicity:'Each file replacement is atomic. Multi-file updates validate first and attempt conflict-aware rollback on failure; not crash-atomic across files.'});
+        truncated:e.old_string.length>240||e.new_string.length>240}))})),atomicity:'Each file replacement is atomic. Multi-file updates validate all exact anchors against the currently locked files first; stale hashes are accepted only when every requested replacement is still uniquely provable or already applied. Commit failures attempt conflict-aware rollback; not crash-atomic across files.'});
   });
 }
 

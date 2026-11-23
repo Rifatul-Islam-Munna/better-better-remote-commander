@@ -126,26 +126,21 @@ async function execute():Promise<unknown>{
       const unawaited=inFlightGuestCalls.size;
       if(unawaited){
         // A detached tools.call() promise can outlive the guest script. Drain
-        // already-started host calls and guest microtasks before disposing the
-        // QuickJS runtime; do not report a successful workflow prematurely.
-        // Follow-on guest continuations may enqueue more calls as jobs run.
-        // The parent owns the deadline and terminates a stuck worker. Never
-        // call JS_FreeRuntime with unresolved QuickJS bridge promises.
+        // every already-started host call and any guest continuation it wakes
+        // before disposing QuickJS. Once this loop ends there is no unresolved
+        // bridge work, so the parent can report a completed workflow with a
+        // warning instead of a synthetic harness failure.
         while(inFlightGuestCalls.size){
           await Promise.allSettled([...inFlightGuestCalls]);
           if(vm.alive)vm.runtime.executePendingJobs();
         }
-        if(settled.error)settled.error.dispose();
-        else settled.value.dispose();
-        throw new Error('CODE_MODE_UNAWAITED_CALLS: '+unawaited+
-          ' asynchronous bridge call(s) were not awaited. Use await tools.call(...) or await Promise.all(...). The started calls have settled; inspect their results before retrying writes.');
       }
       if(settled.error){
         const detail=vm.dump(settled.error) as {message?:unknown}|string;
         settled.error.dispose();
         throw new Error(typeof detail==='string'?detail:String(detail?.message??'Sandbox promise rejected.'));
       }
-      try{return vm.dump(settled.value);}
+      try{return {value:vm.dump(settled.value),unawaitedCalls:unawaited};}
       finally{settled.value.dispose();}
     }finally{promiseHandle.dispose();}
   }finally{

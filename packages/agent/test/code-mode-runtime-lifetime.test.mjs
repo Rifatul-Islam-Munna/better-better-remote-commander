@@ -19,8 +19,9 @@ test('unawaited async guest RPC is reported without a QuickJS runtime assertion'
       finished++;
       return success('late result');
     });
-  assert.equal(out.isError,true,'Unawaited operations must not be reported as successful.');
-  assert.match(JSON.stringify(out),/CODE_MODE_UNAWAITED_CALLS/);
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.unawaitedCallsDrained,1);
+  assert.match(out.content[0].text,/drained 1 detached call/);
   assert.doesNotMatch(JSON.stringify(out),/list_empty|JS_FreeRuntime|Assertion failed/);
   assert.equal(finished,1,'Return only after a started local call has finished.');
 });

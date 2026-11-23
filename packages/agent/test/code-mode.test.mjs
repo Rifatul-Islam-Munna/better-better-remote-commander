@@ -101,10 +101,12 @@ test('nested failure stops workflow by default; later writes are not started',as
    return {isError:true,content:[{type:'text',text:'COMMAND_FAILED: exit 1'}],
      structuredContent:{error:{code:'COMMAND_FAILED',message:'exit 1'},exitCode:1}};
  });
- assert.equal(out.isError,true);
+ assert.equal(out.isError,undefined,JSON.stringify(out));
  assert.deepEqual(calls,['run_command']);
- assert.equal(out.structuredContent.codeMode.partial,true);
- assert.equal(out.structuredContent.codeMode.completedCalls,1);
+ assert.equal(out.structuredContent.status,'stopped_on_step_error');
+ assert.equal(out.structuredContent.stoppedOnError,true);
+ assert.equal(out.structuredContent.completedCalls,1);
+ assert.equal(out.structuredContent.errorCode,'COMMAND_FAILED');
 });
 
 test('a pending build returns job IDs and does not pretend tests finished',async()=>{
@@ -168,8 +170,11 @@ test('infinite loops are interrupted and the worker slot is released',async()=>{
  assert.equal(next.structuredContent.result,7);
 });
 
-test('guest return payload is bounded, without storing source as an activity log',async()=>{
+test('guest return payload is bounded without failing the completed workflow',async()=>{
  const out=await executeCodeMode(args('return "a".repeat(90000);'),[],async()=>text('unused'));
- assert.equal(out.isError,true);
- assert.equal(out.structuredContent.error.code,'CODE_MODE_OUTPUT_LIMIT');
+ assert.equal(out.isError,undefined,JSON.stringify(out));
+ assert.equal(out.structuredContent.outputTruncated,true);
+ assert.equal(out.structuredContent.result,undefined);
+ assert.match(out.content[0].text,/RESULT TRUNCATED/);
+ assert.ok(out.content[0].text.length<52000);
 });

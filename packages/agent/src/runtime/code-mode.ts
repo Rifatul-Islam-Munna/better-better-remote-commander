@@ -286,18 +286,38 @@ export async function executeCodeMode(
           return;
         }
         if(message?.type==='error'){
-          const code=message.message.startsWith('CODE_MODE_UNAWAITED_CALLS:')
-            ?'CODE_MODE_UNAWAITED_CALLS':'CODE_MODE_SCRIPT_FAILED';
-          finish(failureWithSteps(code,message.message.slice(0,900)));
+          const failedSteps=steps.filter(s=>s.outcome==='error'||s.outcome==='uncertain');
+          if(failedSteps.length){
+            const last=failedSteps.at(-1)!;
+            const messageText=message.message.slice(0,900);
+            finish({
+              content:[{type:'text',text:'CODE MODE STOPPED ON STEP ERROR | '+steps.length+
+                ' local tool call(s) | '+(Date.now()-started)+' ms\n'+messageText}],
+              structuredContent:{
+                steps,completedCalls:steps.length,status:'stopped_on_step_error',
+                allCallsSucceeded:false,pending:false,pendingJobs:[],
+                executionCompleted:true,stoppedOnError:true,
+                errorCode:last.errorCode??'TOOL_FAILED',
+                automaticRetry:false,
+              },
+            });
+            return;
+          }
+          finish(failureWithSteps('CODE_MODE_SCRIPT_FAILED',message.message.slice(0,900)));
           return;
         }
         if(message?.type==='done'){
-          const rendered=limited(message.value,MAX_FINAL_RESPONSE);
-          if(rendered.length>=MAX_FINAL_RESPONSE){
-            finish(failureWithSteps('CODE_MODE_OUTPUT_LIMIT',
-              'The returned result is too large. Return a bounded summary or use a direct read tool.'));
-            return;
-          }
+          const envelope=message.value&&typeof message.value==='object'&&!Array.isArray(message.value)
+            ?message.value as Record<string,unknown>:null;
+          const resultValue=envelope&&Object.prototype.hasOwnProperty.call(envelope,'value')
+            ?envelope.value:message.value;
+          const unawaitedCalls=envelope&&typeof envelope.unawaitedCalls==='number'
+            ?Math.max(0,Math.trunc(envelope.unawaitedCalls)):0;
+          const fullRendered=limited(resultValue,Number.MAX_SAFE_INTEGER);
+          const outputTruncated=fullRendered.length>MAX_FINAL_RESPONSE;
+          const rendered=outputTruncated
+            ?fullRendered.slice(0,MAX_FINAL_RESPONSE)+'\n[CODE MODE RESULT TRUNCATED: return a smaller summary or use a direct read tool for the omitted data.]'
+            :fullRendered;
           const pending=pendingJobs.length>0;
           const failedSteps=steps.filter(s=>s.outcome==='error'||s.outcome==='uncertain');
           // A script may catch a failed tool response and continue. Do not
@@ -306,13 +326,16 @@ export async function executeCodeMode(
           const summary='CODE MODE '+status.toUpperCase().replaceAll('_',' ')+
             ' | '+steps.length+' local tool call(s) | '+(Date.now()-started)+' ms'+
             (failedSteps.length?' | '+failedSteps.length+' failed/uncertain step(s)':'')+
+            (unawaitedCalls?' | drained '+unawaitedCalls+' detached call(s)':'')+
+            (outputTruncated?' | final result truncated':'')+
             (pending?' | inspect jobs: '+pendingJobs.join(', '):'');
           finish({
             content:[{type:'text',text:summary+'\n'+rendered}],
             structuredContent:{
-              result:message.value,steps,completedCalls:steps.length,
+              result:outputTruncated?undefined:resultValue,steps,completedCalls:steps.length,
               status,allCallsSucceeded:failedSteps.length===0,
               pending,pendingJobs,executionCompleted:!pending,
+              unawaitedCallsDrained:unawaitedCalls,outputTruncated,
               automaticRetry:false,
             },
           });

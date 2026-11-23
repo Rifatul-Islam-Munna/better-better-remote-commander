@@ -25,6 +25,7 @@ const {
 }=await import('../dist/runtime/harness-vnext.js');
 const {semanticSearch,semanticSearchStatus}=await import('../dist/runtime/semantic-project-search.js');
 const {getProjectSession,roundTripAcceleratorStatus}=await import('../dist/runtime/roundtrip-accelerator.js');
+const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
 const {executeCodeMode}=await import('../dist/runtime/code-mode.js');
 
 after(async()=>{
@@ -222,7 +223,7 @@ test('large nested results stay local behind result handles and can be searched 
   assert.ok(out.structuredContent.result.preview<huge.length);
 });
 
-test('saved workflow can auto-match and execute locally without another ChatGPT round trip',async()=>{
+test('saved workflow can auto-match and execute locally without another calling-AI round trip',async()=>{
   const source=[
     'await tools.snippets.save({name:"auto-math-workflow",description:"auto math workflow",tags:["math","automatic"],source:"return {answer:context.n+1};"});',
     'const run=await tools.call("saved_workflow_run",{query:"auto math workflow",context:{n:4}});',
@@ -296,6 +297,54 @@ test('durable fiber uses persistent jobs and completes locally through wait/stat
   assert.equal(counts.wait,1);
   assert.equal(counts.get,1);
   assert.deepEqual(out.structuredContent.result,{status:'succeeded',completed:1});
+});
+
+test('concurrent Code Mode workflows get isolated UUIDs and obey adaptive runnable slots',async()=>{
+  const before=codeModeScheduler.status();
+  const count=Math.min(before.admittedLimit,Math.max(2,before.activeLimit+1));
+  let running=0,maxRunning=0;
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source='const r=await tools.call("read_file",{path:"same"}); return r.text;';
+  const outputs=await Promise.all(Array.from({length:count},()=>executeCodeMode(
+    args(source,{max_runtime_ms:5000,max_calls:4}),catalog,async()=>{
+      running++;maxRunning=Math.max(maxRunning,running);
+      await new Promise(r=>setTimeout(r,90));
+      running--;return text('ok');
+    }
+  )));
+  assert.ok(outputs.every(x=>x.isError===undefined),JSON.stringify(outputs));
+  const workflowIds=outputs.map(x=>x.structuredContent.workflowId);
+  const executionIds=outputs.map(x=>x.structuredContent.executionId);
+  assert.equal(new Set(workflowIds).size,count);
+  assert.equal(new Set(executionIds).size,count);
+  assert.ok(maxRunning<=before.activeLimit,{maxRunning,limit:before.activeLimit});
+  if(before.activeLimit>1)assert.ok(maxRunning>=2,{maxRunning,limit:before.activeLimit});
+  const after=codeModeScheduler.status();
+  assert.equal(after.active,0);
+  assert.equal(after.queued,0);
+  assert.equal(after.admitted,0);
+  assert.ok(after.hardMaxAdmitted<=12);
+  assert.ok(after.hardMaxActive<=8);
+});
+
+test('Code Mode capacity queues conservatively and rejects only above the hardware-aware admitted limit',async()=>{
+  const before=codeModeScheduler.status();
+  const count=before.admittedLimit+1;
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source='const r=await tools.call("read_file",{path:"capacity"}); return r.text;';
+  const outputs=await Promise.all(Array.from({length:count},()=>executeCodeMode(
+    args(source,{max_runtime_ms:5000,max_calls:4}),catalog,async()=>{
+      await new Promise(r=>setTimeout(r,120));
+      return text('ok');
+    }
+  )));
+  const capacity=outputs.filter(x=>x.isError===true&&x.structuredContent?.error?.code==='CODE_MODE_CAPACITY');
+  assert.ok(capacity.length>=1,{count,limit:before.admittedLimit,codes:outputs.map(x=>x.structuredContent?.error?.code)});
+  assert.ok(outputs.filter(x=>x.isError===undefined).length>=1);
+  const after=codeModeScheduler.status();
+  assert.equal(after.active,0);
+  assert.equal(after.queued,0);
+  assert.equal(after.admitted,0);
 });
 
 test('round-trip accelerator shares the existing 30 MiB harness quota',async()=>{

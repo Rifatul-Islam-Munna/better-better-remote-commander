@@ -7,6 +7,7 @@ import type {ToolResult} from 'brc-shared';
 import {AgentError} from './errors.js';
 import {harnessStateStore} from './bounded-local-store.js';
 import {semanticSearchStatus} from './semantic-project-search.js';
+import {codeModeScheduler} from './code-mode-scheduler.js';
 
 const VERSION=1;
 const EXECUTION_TTL=24*60*60_000;
@@ -43,6 +44,7 @@ export interface DurableStep {
 export interface DurableExecution {
   version:1;
   id:string;
+  invocationKey?:string;
   sourceHash:string;
   source:string;
   createdAt:number;
@@ -179,16 +181,19 @@ export class WorkflowTrace {
   };}
 }
 
-export async function beginDurableExecution(source:string):Promise<{
+export async function beginDurableExecution(source:string,invocationKey?:string):Promise<{
   execution:DurableExecution;trace:WorkflowTrace;resumed:boolean;
 }>{
   const sourceHash=hash(source);
   const records=await harnessStateStore.list<DurableExecution>('execution',64);
   const now=Date.now();
-  const previous=records.find(r=>r.value?.version===VERSION&&r.value.sourceHash===sourceHash&&
+  const candidates=records.filter(r=>r.value?.version===VERSION&&r.value.sourceHash===sourceHash&&
     (r.value.status==='running'||(r.value.status==='uncertain'&&
       !r.value.steps.some(s=>s.state==='uncertain'&&!s.readOnly)))&&
     now-r.value.touchedAt<EXECUTION_TTL);
+  const previous=invocationKey
+    ?candidates.find(r=>r.value.invocationKey===invocationKey)
+    :(candidates.length===1?candidates[0]:undefined);
   if(previous){
     const execution=previous.value;
     execution.cursor=0;execution.touchedAt=now;
@@ -200,7 +205,7 @@ export async function beginDurableExecution(source:string):Promise<{
   }
   const id=randomUUID(),traceId=randomUUID();
   const execution:DurableExecution={
-    version:VERSION,id,sourceHash,source,createdAt:now,touchedAt:now,status:'running',
+    version:VERSION,id,invocationKey,sourceHash,source,createdAt:now,touchedAt:now,status:'running',
     traceId,cursor:0,steps:[],namedSteps:{},
   };
   await harnessStateStore.put('execution',id,execution);
@@ -473,8 +478,9 @@ export async function harnessVNextStatus(){
     snippets:{max:MAX_SNIPPETS,recent:snippets.map(x=>({id:x.value.id,name:x.value.name,uses:x.value.uses,automatic:x.value.automatic}))},
     tracing:{maxEventsPerTrace:MAX_TRACE_EVENTS,recent:traces.map(x=>({id:x.value.id,status:x.value.status,retries:x.value.retries,replayedSteps:x.value.replayedSteps}))},
     retry:{maxAttempts:3,retryCodes:[...RETRY_CODES],mutationsAutomaticallyRetried:false},
+    concurrency:codeModeScheduler.status(),
     lifecycleHooks:['beforeToolCall','afterToolCall','onRetry','checkpoint','finish'],
     specialistAgents:specialistRoles(),
-    note:'Specialist agents are isolated local execution roles using the same ChatGPT-authored workflow and BRC tools; they do not spawn another LLM or require a relay change.',
+    note:'Specialist agents are isolated local execution roles using the calling AI-authored workflow and BRC tools; they do not spawn another LLM or require a relay change.',
   };
 }

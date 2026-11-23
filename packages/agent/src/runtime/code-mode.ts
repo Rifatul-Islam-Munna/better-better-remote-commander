@@ -8,6 +8,7 @@
  * still apply. No automatic replay of failed/uncertain writes is attempted.
  */
 import { Worker } from 'node:worker_threads';
+import {randomUUID} from 'node:crypto';
 import { z } from 'zod';
 import type { ToolResult } from 'brc-shared';
 import type { ToolDefinition } from '../core/tool-definitions.js';
@@ -27,6 +28,7 @@ import {
   saveResourceAlias,getResourceAlias,listResourceAliases,forgetResourceAlias,
   createFiber,getFiber,updateFiber,listFibers,roundTripAcceleratorStatus,
 } from './roundtrip-accelerator.js';
+import {codeModeScheduler,type CodeModeLease} from './code-mode-scheduler.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
@@ -114,7 +116,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
   {
     name:'result_handle',
-    description:'Store/read/search/drop large intermediate results locally instead of returning them through ChatGPT. Automatic large nested tool responses also include a local resultHandle.',
+    description:'Store/read/search/drop large intermediate results locally instead of returning them through the calling AI. Automatic large nested tool responses also include a local resultHandle.',
     inputSchema:{type:'object',required:['op'],properties:{
       op:{type:'string',enum:['store','get','drop']},id:{type:'string'},value:{},label:{type:'string'},
       query:{type:'string'},offset:{type:'integer',minimum:0},length:{type:'integer',minimum:200,maximum:32768}
@@ -173,7 +175,6 @@ const MAX_TOOL_RESPONSE=65_000;
 const MAX_FINAL_RESPONSE=48_000;
 const MAX_TOOL_DISCOVERY=24;
 const MAX_SOURCE_OUTPUT=18_000;
-let activeWorkflow=false;
 
 function blocked(code:string,message:string,steps:Step[]=[]):ToolResult {
   const error=new AgentError(code,message,false);
@@ -258,7 +259,7 @@ async function toolReply(result:ToolResult,label:string):Promise<{value:Record<s
       outputTruncated:true,mediaOmitted,
       ...(handle?{resultHandle:handle}:{}),
       note:handle
-        ?'The full bounded/redacted nested result is retained locally. Query resultHandle inside this Code Mode run instead of returning it through ChatGPT.'
+        ?'The full bounded/redacted nested result is retained locally. Query resultHandle inside this Code Mode run instead of returning it through the calling AI.'
         :'The nested result exceeded the Code Mode limit. Request a smaller range or use the direct tool.'};
     truncated=true;
   }
@@ -269,12 +270,21 @@ export async function executeCodeMode(
   input:z.infer<typeof CodeModeArgsSchema>,catalog:ToolDefinition[],
   executor:Executor,outerSignal?:AbortSignal,
 ):Promise<ToolResult>{
-  if(activeWorkflow)return blocked('CODE_MODE_BUSY','Another Code Mode workflow is already active on this device.');
   if(outerSignal?.aborted)return blocked('CODE_MODE_CANCELLED','The caller cancelled the workflow before it started.');
-  activeWorkflow=true;
+  const parent=getCallContext();
+  const workflowId=randomUUID();
+  let schedulerLease:CodeModeLease;
+  try{schedulerLease=await codeModeScheduler.acquire(workflowId,outerSignal);}
+  catch(error){
+    const e=error instanceof AgentError?error:new AgentError('CODE_MODE_ADMISSION_FAILED',
+      error instanceof Error?error.message:'Code Mode admission failed.',true);
+    const base=failure(e);
+    return {...base,structuredContent:{...base.structuredContent,
+      codeMode:{workflowId,completedSteps:[],completedCalls:0,partial:false,
+        automaticRetry:false,scheduler:codeModeScheduler.status()}}};
+  }
   const steps:Step[]=[];
   const pendingJobs:string[]=[];
-  const parent=getCallContext();
   const controller=new AbortController();
   let activeTool=false;
   let closed=false;
@@ -289,9 +299,9 @@ export async function executeCodeMode(
   const started=Date.now();
 
   let durability:Awaited<ReturnType<typeof beginDurableExecution>>;
-  try{durability=await beginDurableExecution(input.source);}
+  try{durability=await beginDurableExecution(input.source,parent?.id??workflowId);}
   catch(error){
-    activeWorkflow=false;
+    schedulerLease.release();
     return blocked('CODE_MODE_DURABILITY_UNAVAILABLE',
       'Durable Code Mode storage could not initialize: '+(error instanceof Error?error.message.slice(0,400):'unknown local storage error'));
   }
@@ -303,7 +313,8 @@ export async function executeCodeMode(
     if(++calls>input.max_calls)
       return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'Nested tool call budget exhausted.'}};
     if(activeTool)
-      return {ok:false,error:{code:'CODE_MODE_BUSY',message:'Nested calls must run sequentially.'}};
+      return {ok:false,error:{code:'CODE_MODE_NESTED_PARALLEL_DENIED',
+        message:'This Code Mode workflow already has a nested tool call in flight. Keep nested calls sequential, or fan out as separate Code Mode workflows / approved job tools.'}};
     const def=names.get(name)!;
     const readOnly=def.annotations?.readOnlyHint===true;
     if(role&&!specialistAllows(role,name,readOnly))
@@ -766,7 +777,12 @@ export async function executeCodeMode(
           writes.push(observeProjectSessionBatch(activeProjectSessionId,projectObservations));
         void Promise.allSettled(writes).finally(()=>finish(out));
       };
-      const failureWithSteps=(code:string,message:string)=>blocked(code,message,steps);
+      const failureWithSteps=(code:string,message:string)=>{
+        const out=blocked(code,message,steps);
+        out.structuredContent={...out.structuredContent,workflowId,
+          scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart}};
+        return out;
+      };
       const stop=(code:string,message:string)=>{
         if(settled)return;
         controller.abort();
@@ -816,7 +832,8 @@ export async function executeCodeMode(
                 allCallsSucceeded:false,pending:false,pendingJobs:[],
                 executionCompleted:true,stoppedOnError:true,
                 errorCode:last.errorCode??'TOOL_FAILED',
-                executionId:execution.id,traceId:trace.record.id,resumed,
+                workflowId,executionId:execution.id,traceId:trace.record.id,resumed,
+                scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
                 retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
                 automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
               },
@@ -861,7 +878,8 @@ export async function executeCodeMode(
               status,allCallsSucceeded:failedSteps.length===0,
               pending,pendingJobs,executionCompleted:!pending,
               unawaitedCallsDrained:unawaitedCalls,outputTruncated,
-              executionId:execution.id,traceId:trace.record.id,resumed,
+              workflowId,executionId:execution.id,traceId:trace.record.id,resumed,
+              scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
               retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
               storage:{harnessStateMaxBytes:30*1024*1024,semanticCacheMaxBytes:64*1024*1024},
               automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
@@ -888,6 +906,6 @@ export async function executeCodeMode(
     });
   }finally{
     if(!controller.signal.aborted)controller.abort();
-    activeWorkflow=false;
+    schedulerLease.release();
   }
 }

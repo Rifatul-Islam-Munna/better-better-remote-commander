@@ -180,8 +180,8 @@ export async function lookupCallOutcome(callId:string):Promise<CallOutcomeLookup
    guidance:uncertain?
     'The call was received but its completion was not durably recorded. It may have completed before a crash. Inspect the actual state; never replay a mutation automatically.':
     data.outcome==='returned_success'?
-     data.relayJournalConfirmed?'The relay confirmed a durable result receipt. ChatGPT display is not confirmed; use recover_operation to retrieve the stored result if needed.':
-     'The local agent returned success, but delivery to the relay/ChatGPT is not confirmed. Inspect actual state before any mutation retry.':
+     data.relayJournalConfirmed?'The relay confirmed a durable result receipt. Display in the calling AI is not confirmed; use recover_operation to retrieve the stored result if needed.':
+     'The local agent returned success, but delivery to the relay/calling AI is not confirmed. Inspect actual state before any mutation retry.':
      data.outcome==='pending'?
       'The local agent returned a pending job. Query the existing job ID in jobIds using get_job; do not start a duplicate.':
       'The local agent reported failure. Check actual state before retrying because external side effects may still have occurred.'

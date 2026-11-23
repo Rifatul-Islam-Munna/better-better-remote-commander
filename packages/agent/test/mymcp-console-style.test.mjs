@@ -63,7 +63,7 @@ test('errors use the matching failed label and safe structured JSON',()=>{
  assert.match(out,/^\[\d\d:\d\d:\d\d\] ❌ Tool call run_command failed/);
  assert.match(out,/Result preview/);
  assert.match(out,/Operation failed • COMMAND_FAILED • exit 1/);
- assert.match(out,/Next: Inspect the command output returned to ChatGPT/);
+ assert.match(out,/Next: Inspect the command output returned to the calling AI/);
  assert.doesNotMatch(out,/"content"|"exitCode"/);
 });
 

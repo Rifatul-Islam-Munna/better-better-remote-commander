@@ -17,7 +17,7 @@ export interface ToolChoice {
 /** Keep each tool's recommendation concise; detailed parameters live in JSON Schema. */
 export const TOOL_CHOICES: Record<string, ToolChoice> = {
   code_mode: {
-    use: 'PRIMARY DEFAULT for multi-step work: keep reads, searches, edits, tests, project sessions, large-result filtering, reusable sessions and durable jobs local so ChatGPT usually needs one remote MCP call.',
+    use: 'PRIMARY DEFAULT for multi-step work: keep reads, searches, edits, tests, project sessions, large-result filtering, reusable sessions and durable jobs local so the calling AI usually needs one remote MCP call.',
     instead: 'Direct read/edit/command tools remain available as fallback for one simple action or when Code Mode recovery is inappropriate.',
     caveat: 'Bounded QuickJS/WASM only. Durable replay and fibers never blindly replay uncertain mutations; direct fallback tools remain unchanged.',
   },
@@ -414,7 +414,7 @@ export const TOOL_CHOICES: Record<string, ToolChoice> = {
 };
 
 /** Short decision/action rules precede the details; JSON Schema remains authoritative.
- * Keeping tool discovery concise reduces context load on ChatGPT while
+ * Keeping tool discovery concise reduces context load on the calling AI while
  * preserving unusual parameters in schema rather than repeating them in prose.
  */
 export const TOOL_WORKFLOWS: Record<string,string> = {

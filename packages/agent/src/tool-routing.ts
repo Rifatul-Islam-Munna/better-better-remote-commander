@@ -17,9 +17,9 @@ export interface ToolChoice {
 /** Keep each tool's recommendation concise; detailed parameters live in JSON Schema. */
 export const TOOL_CHOICES: Record<string, ToolChoice> = {
   code_mode: {
-    use: 'PRIMARY DEFAULT for most multi-step coding, debugging, project exploration, testing and installed-plugin workflows; combine dependent tool operations with local JavaScript and progressive discovery in one remote MCP call.',
-    instead: 'For a simple read/edit/command use its direct tool; for builds longer than one MCP call use spawn_job then get_job/wait_jobs.',
-    caveat: 'Guest code runs in a bounded QuickJS/WASM worker and can only call permitted BRC tool methods. No Node modules or native host objects. Errors stop the workflow; never blindly replay uncertain changes.',
+    use: 'PRIMARY DEFAULT for multi-step work: keep reads, searches, edits, tests, project sessions, large-result filtering, reusable sessions and durable jobs local so ChatGPT usually needs one remote MCP call.',
+    instead: 'Direct read/edit/command tools remain available as fallback for one simple action or when Code Mode recovery is inappropriate.',
+    caveat: 'Bounded QuickJS/WASM only. Durable replay and fibers never blindly replay uncertain mutations; direct fallback tools remain unchanged.',
   },
   get_config: {
     use: 'Inspect this BRC agent configuration and access limits.',

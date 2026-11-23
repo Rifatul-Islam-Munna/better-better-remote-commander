@@ -15,15 +15,22 @@ import { AgentError, failure } from './errors.js';
 import { getCallContext, withCallContext } from '../context.js';
 import {
   beginDurableExecution,durablePrepareStep,durableSettleStep,finishDurableExecution,
+  durableNamedStepGet,durableNamedStepSave,
   executeWithSafeRetry,beforeToolCall,afterToolCall,searchSnippets,getSnippet,saveSnippet,
-  autoSaveSuccessfulWorkflow,specialistAllows,specialistRoles,harnessVNextStatus,
+  autoSaveSuccessfulWorkflow,selectSavedWorkflow,specialistAllows,specialistRoles,harnessVNextStatus,
   type HarnessReply,
 } from './harness-vnext.js';
 import {semanticSearch} from './semantic-project-search.js';
+import {
+  openProjectSession,getProjectSession,updateProjectSession,listProjectSessions,observeProjectSessionBatch,
+  putResultHandle,maybePutResultHandle,readResultHandle,dropResultHandle,
+  saveResourceAlias,getResourceAlias,listResourceAliases,forgetResourceAlias,
+  createFiber,getFiber,updateFiber,listFibers,roundTripAcceleratorStatus,
+} from './roundtrip-accelerator.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
-type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace';name?:unknown;args?:unknown;query?:unknown};
+type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow';name?:unknown;args?:unknown;query?:unknown};
 type RpcReply = {ok:boolean;value?:unknown;error?:{code:string;message:string}};
 type Step = {tool:string;outcome:'ok'|'error'|'pending'|'uncertain';durationMs:number;errorCode?:string;jobId?:string;outputTruncated?:boolean;attempts?:number;replayed?:boolean;role?:string};
 type WorkerMessage =
@@ -91,6 +98,63 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
       steps:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{tool:{type:'string'},args:{type:'object'}}}},
       continue_on_error:{type:'boolean'}
     }},annotations:{readOnlyHint:false,destructiveHint:true}
+  },
+  {
+    name:'project_session',
+    description:'Open/get/update/list a persistent local project session so later Code Mode runs can reuse project state, recent paths, job IDs and terminal session IDs without rediscovery.',
+    inputSchema:{type:'object',required:['op'],properties:{
+      op:{type:'string',enum:['open','get','update','list']},id:{type:'string'},name:{type:'string'},
+      root:{type:'string'},state:{type:'object'},patch:{type:'object'},limit:{type:'integer',minimum:1,maximum:64}
+    }},annotations:{readOnlyHint:false,destructiveHint:false}
+  },
+  {
+    name:'durable_step',
+    description:'Named durable checkpoint helper. Preferred form inside Code Mode is await tools.step("name", async()=>{...}); completed values replay locally after interruption.',
+    inputSchema:{type:'object',required:['name'],properties:{name:{type:'string'}}},annotations:{readOnlyHint:false,destructiveHint:false}
+  },
+  {
+    name:'result_handle',
+    description:'Store/read/search/drop large intermediate results locally instead of returning them through ChatGPT. Automatic large nested tool responses also include a local resultHandle.',
+    inputSchema:{type:'object',required:['op'],properties:{
+      op:{type:'string',enum:['store','get','drop']},id:{type:'string'},value:{},label:{type:'string'},
+      query:{type:'string'},offset:{type:'integer',minimum:0},length:{type:'integer',minimum:200,maximum:32768}
+    }},annotations:{readOnlyHint:false,destructiveHint:false}
+  },
+  {
+    name:'reusable_terminal',
+    description:'Start or reuse a named terminal session, then read/send/forget it by alias. Reuses existing stable BRC terminal session IDs instead of repeatedly launching processes.',
+    inputSchema:{type:'object',required:['op','name'],properties:{
+      op:{type:'string',enum:['start','get','read','send','list','forget']},name:{type:'string'},
+      startArgs:{type:'object'},input:{type:'string'},cursor:{type:'integer',minimum:0},length:{type:'integer',minimum:1,maximum:2000}
+    }},annotations:{readOnlyHint:false,destructiveHint:true}
+  },
+  {
+    name:'reusable_browser',
+    description:'Bind/reuse one named browser plugin session and call Playwright/plugin tools through the existing plugin connection. Does not start a second browser or change relay tools.',
+    inputSchema:{type:'object',required:['op','name'],properties:{
+      op:{type:'string',enum:['bind','get','call','list','forget']},name:{type:'string'},plugin:{type:'string'},
+      tool:{type:'string'},args:{type:'object'},metadata:{type:'object'}
+    }},annotations:{readOnlyHint:false,destructiveHint:true}
+  },
+  {
+    name:'saved_workflow_run',
+    description:'Automatically match and execute one unambiguous saved successful Code Mode workflow locally. Use tools.call("saved_workflow_run",{query,context}) or tools.workflows.run(query,context).',
+    inputSchema:{type:'object',required:['query'],properties:{query:{type:'string'},context:{type:'object'}}},
+    annotations:{readOnlyHint:false,destructiveHint:true}
+  },
+  {
+    name:'durable_fiber',
+    description:'Create/start/status/wait/resume/list a named long-running durable fiber backed by existing persistent BRC background jobs. Safe interrupted read-only tails can resume; uncertain mutations are not replayed.',
+    inputSchema:{type:'object',required:['op'],properties:{
+      op:{type:'string',enum:['create','start','status','wait','resume','list']},name:{type:'string'},
+      steps:{type:'array',minItems:1,maxItems:50,items:{type:'object'}},continue_on_error:{type:'boolean'},
+      timeout_ms:{type:'integer',minimum:1000,maximum:21600000},wait_ms:{type:'integer',minimum:0,maximum:100000}
+    }},annotations:{readOnlyHint:false,destructiveHint:true}
+  },
+  {
+    name:'roundtrip_status',
+    description:'Inspect persistent project sessions, local result handles, reusable aliases and durable fibers sharing the 30 MiB harness quota.',
+    inputSchema:{type:'object',properties:{}},annotations:{readOnlyHint:true}
   },
   {
     name:'harness_status',
@@ -167,25 +231,35 @@ function search(catalog:ToolDefinition[],query:string):unknown {
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score||a.def.name.localeCompare(b.def.name));
   return hits.slice(0,12).map(x=>({name:x.def.name,description:x.def.description.slice(0,180)}));
 }
-function toolReply(result:ToolResult):{value:Record<string,unknown>;truncated:boolean}{
+async function toolReply(result:ToolResult,label:string):Promise<{value:Record<string,unknown>;truncated:boolean}>{
   const content=Array.isArray(result.content)?result.content:[];
   const textContent=content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
   const mediaOmitted=content.some(c=>c.type!=='text');
-  let value:Record<string,unknown>={
-    text:textContent.slice(0,MAX_TOOL_TEXT),
+  const fullValue:Record<string,unknown>={
+    text:textContent,
     isError:!!result.isError,
     pending:result.structuredContent?.pending===true,
     mediaOmitted,
     ...(result.structuredContent?{structuredContent:result.structuredContent}:{})
   };
+  const handle=await maybePutResultHandle(fullValue,label).catch(()=>null);
+  let value:Record<string,unknown>={
+    text:textContent.slice(0,MAX_TOOL_TEXT),
+    isError:!!result.isError,
+    pending:result.structuredContent?.pending===true,
+    mediaOmitted,
+    ...(result.structuredContent?{structuredContent:result.structuredContent}:{}),
+    ...(handle?{resultHandle:handle}:{})
+  };
   let truncated=textContent.length>MAX_TOOL_TEXT;
   if(limited(value,MAX_TOOL_RESPONSE).length>=MAX_TOOL_RESPONSE){
-    // Avoid truncated JSON, especially for image/PDF tool payloads. The
-    // caller can request narrower ranges through the original tool.
     value={text:textContent.slice(0,MAX_SOURCE_OUTPUT),
       isError:!!result.isError,pending:result.structuredContent?.pending===true,
       outputTruncated:true,mediaOmitted,
-      note:'The nested result exceeded the Code Mode limit. Request a smaller range or use the direct tool.'};
+      ...(handle?{resultHandle:handle}:{}),
+      note:handle
+        ?'The full bounded/redacted nested result is retained locally. Query resultHandle inside this Code Mode run instead of returning it through ChatGPT.'
+        :'The nested result exceeded the Code Mode limit. Request a smaller range or use the direct tool.'};
     truncated=true;
   }
   return {value,truncated};
@@ -206,6 +280,8 @@ export async function executeCodeMode(
   let closed=false;
   let calls=0;
   let discoveries=0;
+  let activeProjectSessionId:string|undefined;
+  const projectObservations:Array<{tool:string;args:Args;meta:Record<string,unknown>}>=[];
   const catalogView=catalog.filter(t=>CODE_MODE_ALLOWED_TOOLS.has(t.name));
   const discoveryCatalog=[...catalogView,...CODE_MODE_VIRTUAL_TOOLS];
   const names=new Map(catalogView.map(t=>[t.name,t]));
@@ -281,7 +357,7 @@ export async function executeCodeMode(
       const code=typeof error?.code==='string'?error.code:'TOOL_FAILED';
       const jobId=typeof meta.jobId==='string'?meta.jobId:undefined;
       const status=response.isError?'error':pending?'pending':'ok';
-      const {value,truncated}=toolReply(response);
+      const {value,truncated}=await toolReply(response,name);
       const reply:HarnessReply=response.isError
         ?{ok:false,error:{code,message:(typeof value.text==='string'?value.text:'Tool failed.').slice(0,700)}}
         :{ok:true,value};
@@ -290,6 +366,8 @@ export async function executeCodeMode(
         ...(response.isError?{errorCode:code}:{}),...(jobId?{jobId}:{}),
         ...(truncated?{outputTruncated:true}:{}),attempts,...(role?{role}:{})});
       if(pending&&jobId)pendingJobs.push(jobId);
+      if(activeProjectSessionId&&projectObservations.length<64)
+        projectObservations.push({tool:name,args:lifecycle.args,meta});
       return reply;
     }catch(error){
       const uncertain=controller.signal.aborted||!readOnly;
@@ -314,7 +392,7 @@ export async function executeCodeMode(
       if(request.type==='search'){
         if(typeof request.query!=='string'||request.query.length>160)
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Search query must be a short string.'}};
-        const harnessIntent=/\b(?:semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry)\b/i.test(request.query);
+        const harnessIntent=/\b(?:semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip)\b/i.test(request.query);
         return {ok:true,value:search(harnessIntent?discoveryCatalog:catalogView,request.query)};
       }
       const name=request.name;
@@ -381,8 +459,212 @@ export async function executeCodeMode(
         return {ok:false,error:{code,message:error instanceof Error?error.message.slice(0,600):'Snippet operation failed.'}};
       }
     }
+    if(request.type==='step'){
+      try{
+        if(typeof request.name!=='string')
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Durable step requires a name.'}};
+        const a=request.args&&typeof request.args==='object'&&!Array.isArray(request.args)
+          ?request.args as Record<string,unknown>:{};
+        if(a.op==='get')return {ok:true,value:await durableNamedStepGet(execution,request.name,trace)};
+        if(a.op==='save')return {ok:true,value:await durableNamedStepSave(execution,request.name,a.value,trace)};
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Durable step operation must be get or save.'}};
+      }catch(error){
+        const code=error instanceof AgentError?error.code:'DURABLE_STEP_FAILED';
+        return {ok:false,error:{code,message:error instanceof Error?error.message.slice(0,600):'Durable step failed.'}};
+      }
+    }
+    if(request.type==='workflow'){
+      if(request.name!=='match'||typeof request.query!=='string'||request.query.length<2||request.query.length>500)
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Workflow match requires a 2-500 character query.'}};
+      const match=await selectSavedWorkflow(request.query);
+      if(!match)return {ok:true,value:{found:false}};
+      await trace.event('workflow_auto_match',{detail:{id:match.id,name:match.name,score:match.matchScore}});
+      return {ok:true,value:{found:true,id:match.id,name:match.name,score:match.matchScore,
+        description:match.description,tags:match.tags,source:match.source}};
+    }
+    if(request.type==='roundtrip'){
+      const a=request.args&&typeof request.args==='object'&&!Array.isArray(request.args)
+        ?request.args as Record<string,unknown>:{};
+      try{
+        if(request.name==='session_open'){
+          const record=await openProjectSession({
+            name:typeof a.name==='string'?a.name:undefined,
+            root:typeof a.root==='string'?a.root:undefined,
+            state:a.state&&typeof a.state==='object'&&!Array.isArray(a.state)?a.state as Record<string,unknown>:undefined,
+          });
+          activeProjectSessionId=record.id;
+          await trace.event('project_session_open',{detail:{id:record.id,name:record.name,root:record.root}});
+          return {ok:true,value:record};
+        }
+        if(request.name==='session_get'){
+          const id=typeof a.id==='string'?a.id:typeof a.name==='string'?a.name:'';
+          if(!id)return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Project session get requires id or name.'}};
+          const record=await getProjectSession(id);
+          if(!record)return {ok:false,error:{code:'PROJECT_SESSION_NOT_FOUND',message:'Persistent project session was not found.'}};
+          activeProjectSessionId=record.id;
+          return {ok:true,value:record};
+        }
+        if(request.name==='session_update'){
+          const id=typeof a.id==='string'?a.id:'';
+          if(!id||!a.patch||typeof a.patch!=='object'||Array.isArray(a.patch))
+            return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Project session update requires id and patch object.'}};
+          const record=await updateProjectSession(id,a.patch as Record<string,unknown>);
+          activeProjectSessionId=record.id;
+          return {ok:true,value:record};
+        }
+        if(request.name==='session_list')
+          return {ok:true,value:await listProjectSessions(typeof a.limit==='number'?a.limit:20)};
+        if(request.name==='result_store')
+          return {ok:true,value:await putResultHandle(a.value,typeof a.label==='string'?a.label:'result')};
+        if(request.name==='result_get'){
+          if(typeof a.id!=='string')return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Result handle get requires id.'}};
+          return {ok:true,value:await readResultHandle({id:a.id,
+            offset:typeof a.offset==='number'?a.offset:undefined,length:typeof a.length==='number'?a.length:undefined,
+            query:typeof a.query==='string'?a.query:undefined})};
+        }
+        if(request.name==='result_drop'){
+          if(typeof a.id!=='string')return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Result handle drop requires id.'}};
+          return {ok:true,value:await dropResultHandle(a.id)};
+        }
+        if(request.name==='terminal'){
+          const op=typeof a.op==='string'?a.op:'get',name=typeof a.name==='string'?a.name:'';
+          if(op==='list')return {ok:true,value:await listResourceAliases('terminal')};
+          if(!name)return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Reusable terminal requires a name.'}};
+          if(op==='forget')return {ok:true,value:await forgetResourceAlias('terminal',name)};
+          const alias=await getResourceAlias('terminal',name);
+          if(op==='get')return alias?{ok:true,value:alias}:{ok:false,error:{code:'SESSION_ALIAS_NOT_FOUND',message:'Reusable terminal alias was not found.'}};
+          if(op==='read'){
+            const sessionId=alias?.reference.sessionId;
+            if(typeof sessionId!=='string')return {ok:false,error:{code:'SESSION_ALIAS_NOT_FOUND',message:'Reusable terminal alias has no session ID.'}};
+            return runToolCall('read_process_output',{session_id:sessionId,cursor:typeof a.cursor==='number'?a.cursor:0,
+              length:typeof a.length==='number'?a.length:200,timeout_ms:0});
+          }
+          if(op==='send'){
+            const sessionId=alias?.reference.sessionId;
+            if(typeof sessionId!=='string'||typeof a.input!=='string')
+              return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Reusable terminal send requires an existing alias and input.'}};
+            return runToolCall('interact_with_process',{session_id:sessionId,input:a.input,timeout_ms:3000});
+          }
+          if(op==='start'){
+            if(alias&&typeof alias.reference.sessionId==='string'){
+              const probe=await runToolCall('read_process_output',{session_id:alias.reference.sessionId,cursor:0,length:1,timeout_ms:0});
+              const probeValue=probe.ok&&probe.value&&typeof probe.value==='object'?probe.value as Record<string,unknown>:null;
+              const structured=probeValue?.structuredContent&&typeof probeValue.structuredContent==='object'
+                ?probeValue.structuredContent as Record<string,unknown>:null;
+              if(probe.ok&&structured?.processRunning===true)
+                return {ok:true,value:{reused:true,alias,probe:probe.value}};
+            }
+            if(!a.startArgs||typeof a.startArgs!=='object'||Array.isArray(a.startArgs))
+              return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Starting a reusable terminal requires startArgs for start_process.'}};
+            const startedReply=await runToolCall('start_process',a.startArgs as Args);
+            if(!startedReply.ok)return startedReply;
+            const startedValue=startedReply.value&&typeof startedReply.value==='object'?startedReply.value as Record<string,unknown>:{};
+            const structured=startedValue.structuredContent&&typeof startedValue.structuredContent==='object'
+              ?startedValue.structuredContent as Record<string,unknown>:{};
+            if(typeof structured.sessionId!=='string')
+              return {ok:false,error:{code:'SESSION_ID_MISSING',message:'start_process did not return a stable session ID.'}};
+            const saved=await saveResourceAlias({kind:'terminal',name,reference:{sessionId:structured.sessionId,pid:structured.pid},
+              metadata:{startedAt:Date.now()}});
+            return {ok:true,value:{reused:false,alias:saved,result:startedReply.value}};
+          }
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Unknown reusable terminal operation.'}};
+        }
+        if(request.name==='browser'){
+          const op=typeof a.op==='string'?a.op:'get',name=typeof a.name==='string'?a.name:'';
+          if(op==='list')return {ok:true,value:await listResourceAliases('browser')};
+          if(!name)return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Reusable browser requires a name.'}};
+          if(op==='forget')return {ok:true,value:await forgetResourceAlias('browser',name)};
+          let alias=await getResourceAlias('browser',name);
+          if(op==='bind'){
+            if(typeof a.plugin!=='string')return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Browser bind requires plugin id.'}};
+            alias=await saveResourceAlias({kind:'browser',name,reference:{plugin:a.plugin},
+              metadata:a.metadata&&typeof a.metadata==='object'&&!Array.isArray(a.metadata)?a.metadata as Record<string,unknown>:{}});
+            return {ok:true,value:alias};
+          }
+          if(op==='get')return alias?{ok:true,value:alias}:{ok:false,error:{code:'SESSION_ALIAS_NOT_FOUND',message:'Reusable browser alias was not found.'}};
+          if(op==='call'){
+            const plugin=typeof a.plugin==='string'?a.plugin:alias?.reference.plugin;
+            if(typeof plugin!=='string'||typeof a.tool!=='string')
+              return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Browser call requires a bound plugin and tool.'}};
+            if(!alias)alias=await saveResourceAlias({kind:'browser',name,reference:{plugin},metadata:{}});
+            return runToolCall('call_plugin_tool',{plugin,tool:a.tool,
+              args:a.args&&typeof a.args==='object'&&!Array.isArray(a.args)?a.args as Record<string,unknown>:{}});
+          }
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Unknown reusable browser operation.'}};
+        }
+        if(request.name==='fiber'){
+          const op=typeof a.op==='string'?a.op:'status';
+          if(op==='list')return {ok:true,value:await listFibers(typeof a.limit==='number'?a.limit:20)};
+          const name=typeof a.name==='string'?a.name:'';
+          if(!name)return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Durable fiber requires a name.'}};
+          let fiber=await getFiber(name);
+          if(op==='create'||(!fiber&&Array.isArray(a.steps))){
+            if(!Array.isArray(a.steps))return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Fiber create requires steps.'}};
+            fiber=await createFiber({name,steps:a.steps.filter(x=>x&&typeof x==='object'&&!Array.isArray(x)) as Array<Record<string,unknown>>,
+              continueOnError:a.continue_on_error===true,timeoutMs:typeof a.timeout_ms==='number'?a.timeout_ms:undefined});
+            if(op==='create')return {ok:true,value:fiber};
+          }
+          if(!fiber)return {ok:false,error:{code:'FIBER_NOT_FOUND',message:'Durable fiber was not found.'}};
+          const reconcile=async()=>{
+            if(!fiber!.currentJobId)return fiber!;
+            const job=await runToolCall('get_job',{id:fiber!.currentJobId,output_chars:1500,step_limit:1});
+            if(!job.ok)return fiber!;
+            const v=job.value&&typeof job.value==='object'?job.value as Record<string,unknown>:{};
+            const sc=v.structuredContent&&typeof v.structuredContent==='object'?v.structuredContent as Record<string,unknown>:{};
+            const status=typeof sc.status==='string'?sc.status:undefined;
+            const results=typeof sc.results==='number'?Math.max(0,Math.trunc(sc.results)):0;
+            const base=fiber!.jobStartStep??fiber!.completedSteps;
+            fiber=await updateFiber(fiber!.id,{completedSteps:Math.min(fiber!.steps.length,base+results),
+              lastJobStatus:status,currentJobId:status&&['queued','running'].includes(status)?fiber!.currentJobId:undefined,
+              status:status==='succeeded'?'succeeded':status==='failed'?'failed':status==='cancelled'?'cancelled':
+                status==='interrupted'||status==='timed_out'?'interrupted':status==='queued'||status==='running'?'running':fiber!.status});
+            return fiber!;
+          };
+          if(op==='status')return {ok:true,value:await reconcile()};
+          if(op==='wait'){
+            if(!fiber.currentJobId)return {ok:true,value:fiber};
+            await runToolCall('wait_jobs',{ids:[fiber.currentJobId],timeout_ms:typeof a.wait_ms==='number'?a.wait_ms:5000,output_chars:2000});
+            return {ok:true,value:await reconcile()};
+          }
+          if(op==='start'||op==='resume'){
+            await reconcile();
+            if(fiber.status==='running')return {ok:true,value:fiber};
+            if(fiber.status==='succeeded')return {ok:true,value:fiber};
+            const remaining=fiber.steps.slice(fiber.completedSteps);
+            if(!remaining.length){
+              fiber=await updateFiber(fiber.id,{status:'succeeded'});
+              return {ok:true,value:fiber};
+            }
+            if(op==='resume'&&fiber.status==='interrupted'){
+              const safe=remaining.every(step=>{
+                if(typeof step.tool!=='string')return false;
+                return names.get(step.tool)?.annotations?.readOnlyHint===true;
+              });
+              if(!safe)return {ok:false,error:{code:'FIBER_MUTATION_UNCERTAIN',
+                message:'Interrupted fiber has command or non-read-only steps remaining. Inspect effects before starting a fresh fiber; no automatic replay occurred.'}};
+            }
+            const spawned=await runToolCall('spawn_job',{steps:remaining,label:'fiber:'+fiber.name,
+              group:'fiber-'+fiber.id.slice(0,12),continue_on_error:fiber.continueOnError,timeout_ms:fiber.timeoutMs});
+            if(!spawned.ok)return spawned;
+            const v=spawned.value&&typeof spawned.value==='object'?spawned.value as Record<string,unknown>:{};
+            const sc=v.structuredContent&&typeof v.structuredContent==='object'?v.structuredContent as Record<string,unknown>:{};
+            if(typeof sc.jobId!=='string')return {ok:false,error:{code:'FIBER_JOB_ID_MISSING',message:'Background job did not return a job ID.'}};
+            fiber=await updateFiber(fiber.id,{status:'running',currentJobId:sc.jobId,jobStartStep:fiber.completedSteps,
+              jobIds:[...fiber.jobIds,sc.jobId].slice(-16)});
+            await trace.event('fiber_started',{detail:{name:fiber.name,jobId:sc.jobId,remaining:remaining.length}});
+            return {ok:true,value:fiber};
+          }
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Unknown durable fiber operation.'}};
+        }
+        if(request.name==='status')return {ok:true,value:await roundTripAcceleratorStatus()};
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Unknown round-trip accelerator operation.'}};
+      }catch(error){
+        const code=error instanceof AgentError?error.code:'ROUNDTRIP_ACCELERATOR_FAILED';
+        return {ok:false,error:{code,message:error instanceof Error?error.message.slice(0,700):'Round-trip accelerator operation failed.'}};
+      }
+    }
     if(request.type==='harness'&&request.name==='status')
-      return {ok:true,value:await harnessVNextStatus()};
+      return {ok:true,value:{...(await harnessVNextStatus()),roundtrip:await roundTripAcceleratorStatus()}};
     if(request.type==='trace'&&request.name==='current')
       return {ok:true,value:trace.snapshot()};
     if(request.type==='agent'){
@@ -431,6 +713,27 @@ export async function executeCodeMode(
         return handleRpc({type:'snippet',name:'save',args:virtualArgs});
       if(request.name==='specialist_agent')
         return handleRpc({type:'agent',name:'run',args:virtualArgs});
+      if(request.name==='project_session'){
+        const op=typeof virtualArgs.op==='string'?virtualArgs.op:'get';
+        return handleRpc({type:'roundtrip',name:'session_'+op,args:virtualArgs});
+      }
+      if(request.name==='durable_step'){
+        if(typeof virtualArgs.name!=='string')
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'durable_step requires name. Prefer tools.step(name, async()=>...).'}};
+        return handleRpc({type:'step',name:virtualArgs.name,args:{op:'get'}});
+      }
+      if(request.name==='result_handle'){
+        const op=typeof virtualArgs.op==='string'?virtualArgs.op:'get';
+        return handleRpc({type:'roundtrip',name:'result_'+op,args:virtualArgs});
+      }
+      if(request.name==='reusable_terminal')
+        return handleRpc({type:'roundtrip',name:'terminal',args:virtualArgs});
+      if(request.name==='reusable_browser')
+        return handleRpc({type:'roundtrip',name:'browser',args:virtualArgs});
+      if(request.name==='durable_fiber')
+        return handleRpc({type:'roundtrip',name:'fiber',args:virtualArgs});
+      if(request.name==='roundtrip_status')
+        return handleRpc({type:'roundtrip',name:'status',args:{}});
       if(request.name==='harness_status')
         return handleRpc({type:'harness',name:'status',args:{}});
       if(request.name==='workflow_trace')
@@ -458,8 +761,10 @@ export async function executeCodeMode(
       };
       const finishPersisted=(status:'completed'|'failed'|'cancelled'|'uncertain',out:ToolResult,result:unknown)=>{
         if(settled)return;
-        void finishDurableExecution(execution,status,result,trace)
-          .catch(()=>undefined).finally(()=>finish(out));
+        const writes:Promise<unknown>[]=[finishDurableExecution(execution,status,result,trace)];
+        if(activeProjectSessionId&&projectObservations.length)
+          writes.push(observeProjectSessionBatch(activeProjectSessionId,projectObservations));
+        void Promise.allSettled(writes).finally(()=>finish(out));
       };
       const failureWithSteps=(code:string,message:string)=>blocked(code,message,steps);
       const stop=(code:string,message:string)=>{

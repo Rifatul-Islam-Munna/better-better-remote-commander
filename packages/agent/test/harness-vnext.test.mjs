@@ -24,6 +24,7 @@ const {
   harnessVNextStatus,
 }=await import('../dist/runtime/harness-vnext.js');
 const {semanticSearch,semanticSearchStatus}=await import('../dist/runtime/semantic-project-search.js');
+const {getProjectSession,roundTripAcceleratorStatus}=await import('../dist/runtime/roundtrip-accelerator.js');
 const {executeCodeMode}=await import('../dist/runtime/code-mode.js');
 
 after(async()=>{
@@ -175,6 +176,133 @@ test('new harness capabilities are discoverable through the legacy Code Mode too
   assert.ok(out.structuredContent.result.names.includes('semantic_project_search'));
   assert.equal(out.structuredContent.result.schema,'semantic_project_search');
   assert.ok(out.structuredContent.result.results.includes('auth.guard.ts'));
+});
+
+test('named tools.step checkpoint executes its function only once inside Code Mode',async()=>{
+  const source=[
+    'let n=0;',
+    'const a=await tools.step("inspect",async()=>++n);',
+    'const b=await tools.step("inspect",async()=>++n);',
+    'return {a,b,n};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),[],async()=>{throw new Error('no native tool expected');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.deepEqual(out.structuredContent.result,{a:1,b:1,n:1});
+});
+
+test('persistent project sessions retain bounded state and tool observations',async()=>{
+  const source=[
+    'const s=await tools.sessions.open({name:"persist-project",root:'+JSON.stringify(project)+',state:{branch:"main",password:"do-not-store"}});',
+    'await tools.call("read_file",{path:'+JSON.stringify(path.join(project,'auth.guard.ts'))+'});',
+    'return s.id;',
+  ].join('\n');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const out=await executeCodeMode(args(source),catalog,async()=>text('ok'));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  const saved=await getProjectSession(out.structuredContent.result);
+  assert.equal(saved.state.branch,'main');
+  assert.equal(saved.state.password,'[REDACTED]');
+  assert.ok(saved.recentTools.includes('read_file'));
+  assert.ok(saved.recentPaths.some(x=>x.endsWith('auth.guard.ts')));
+});
+
+test('large nested results stay local behind result handles and can be searched in same Code Mode call',async()=>{
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const marker='UNIQUE_LOCAL_HANDLE_MARKER';
+  const huge='x'.repeat(90000)+marker+'y'.repeat(30000);
+  const source=[
+    'const r=await tools.call("read_file",{path:"x"});',
+    'const found=await tools.results.get(r.resultHandle.id,{query:'+JSON.stringify(marker)+'});',
+    'return {handle:!!r.resultHandle,hits:found.hits.length,preview:r.text.length,partial:r.resultHandle.partial};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async()=>text(huge));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.result.handle,true);
+  assert.ok(out.structuredContent.result.hits>=1);
+  assert.ok(out.structuredContent.result.preview<huge.length);
+});
+
+test('saved workflow can auto-match and execute locally without another ChatGPT round trip',async()=>{
+  const source=[
+    'await tools.snippets.save({name:"auto-math-workflow",description:"auto math workflow",tags:["math","automatic"],source:"return {answer:context.n+1};"});',
+    'const run=await tools.call("saved_workflow_run",{query:"auto math workflow",context:{n:4}});',
+    'return run;',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),[],async()=>{throw new Error('no native tool expected');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.result.matched,true);
+  assert.equal(out.structuredContent.result.value.answer,5);
+});
+
+test('named terminal session is reused instead of launching a second process',async()=>{
+  const counts={start:0,read:0};
+  const catalog=[
+    {name:'start_process',description:'start',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'read_process_output',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'interact_with_process',description:'send',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const source=[
+    'const one=await tools.terminal.use({op:"start",name:"dev",startArgs:{command:"dev"}});',
+    'const two=await tools.terminal.use({op:"start",name:"dev",startArgs:{command:"dev"}});',
+    'return {firstReused:one.reused,secondReused:two.reused};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async(name)=>{
+    if(name==='start_process'){counts.start++;return {content:[{type:'text',text:'started'}],structuredContent:{pid:7,sessionId:'sess-1',processMayStillBeRunning:true}};}
+    if(name==='read_process_output'){counts.read++;return {content:[{type:'text',text:'running'}],structuredContent:{sessionId:'sess-1',processRunning:true}};}
+    return text('ok');
+  });
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(counts.start,1);
+  assert.equal(counts.read,1);
+  assert.deepEqual(out.structuredContent.result,{firstReused:false,secondReused:true});
+});
+
+test('reusable browser alias calls the same existing plugin connection',async()=>{
+  const calls=[];
+  const catalog=[{name:'call_plugin_tool',description:'plugin',inputSchema:{type:'object'},annotations:{readOnlyHint:false}}];
+  const source=[
+    'await tools.browser.use({op:"bind",name:"ui",plugin:"playwright"});',
+    'await tools.browser.use({op:"call",name:"ui",tool:"browser_snapshot",args:{}});',
+    'await tools.browser.use({op:"call",name:"ui",tool:"browser_get_title",args:{}});',
+    'return "ok";',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async(name,a)=>{calls.push({name,a});return text('ok');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(calls.length,2);
+  assert.ok(calls.every(x=>x.a.plugin==='playwright'));
+});
+
+test('durable fiber uses persistent jobs and completes locally through wait/status',async()=>{
+  const counts={spawn:0,wait:0,get:0};
+  const catalog=[
+    {name:'spawn_job',description:'spawn',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'wait_jobs',description:'wait',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'get_job',description:'get',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+  ];
+  const source=[
+    'await tools.fibers.run({op:"start",name:"scan",steps:[{tool:"read_file",args:{path:"x"}}]});',
+    'const done=await tools.fibers.run({op:"wait",name:"scan",wait_ms:10});',
+    'return {status:done.status,completed:done.completedSteps};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:12}),catalog,async(name)=>{
+    if(name==='spawn_job'){counts.spawn++;return {content:[{type:'text',text:'started'}],structuredContent:{jobId:'job-1',pending:true,status:'running'}};}
+    if(name==='wait_jobs'){counts.wait++;return text('done');}
+    if(name==='get_job'){counts.get++;return {content:[{type:'text',text:'done'}],structuredContent:{jobId:'job-1',status:'succeeded',steps:1,results:1}};}
+    return text('unused');
+  });
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(counts.spawn,1);
+  assert.equal(counts.wait,1);
+  assert.equal(counts.get,1);
+  assert.deepEqual(out.structuredContent.result,{status:'succeeded',completed:1});
+});
+
+test('round-trip accelerator shares the existing 30 MiB harness quota',async()=>{
+  const status=await roundTripAcceleratorStatus();
+  assert.equal(status.store.maxBytes,HARNESS_STATE_BYTES);
+  assert.ok(status.store.bytes<=HARNESS_STATE_BYTES);
+  assert.ok(status.resultHandles.maxRecordBytes<=2*1024*1024);
 });
 
 test('harness status exposes bounded storage, traces, retries and semantic quota',async()=>{

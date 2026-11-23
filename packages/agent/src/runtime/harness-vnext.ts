@@ -51,6 +51,7 @@ export interface DurableExecution {
   traceId:string;
   cursor:number;
   steps:DurableStep[];
+  namedSteps?:Record<string,{value:unknown;storedAt:number;digest:string}>;
   resultDigest?:string;
   finishedAt?:number;
 }
@@ -200,7 +201,7 @@ export async function beginDurableExecution(source:string):Promise<{
   const id=randomUUID(),traceId=randomUUID();
   const execution:DurableExecution={
     version:VERSION,id,sourceHash,source,createdAt:now,touchedAt:now,status:'running',
-    traceId,cursor:0,steps:[],
+    traceId,cursor:0,steps:[],namedSteps:{},
   };
   await harnessStateStore.put('execution',id,execution);
   const trace=await WorkflowTrace.create(id,sourceHash,traceId);
@@ -288,6 +289,38 @@ export async function finishDurableExecution(
   execution.resultDigest=hash(stable(result).slice(0,100_000));
   await harnessStateStore.put('execution',execution.id,execution);
   await trace.finish(status,result);
+}
+
+export async function durableNamedStepGet(
+  execution:DurableExecution,name:string,trace:WorkflowTrace,
+){
+  const key=name.trim().slice(0,120);
+  if(!key)throw new AgentError('INVALID_ARGUMENT','Durable step name is required.');
+  const found=execution.namedSteps?.[key];
+  if(found){
+    await trace.event('named_step_replay',{detail:{name:key,storedAt:found.storedAt}});
+    return {found:true,value:found.value,storedAt:found.storedAt,digest:found.digest};
+  }
+  await trace.event('named_step_miss',{detail:{name:key}});
+  return {found:false};
+}
+export async function durableNamedStepSave(
+  execution:DurableExecution,name:string,value:unknown,trace:WorkflowTrace,
+){
+  const key=name.trim().slice(0,120);
+  if(!key)throw new AgentError('INVALID_ARGUMENT','Durable step name is required.');
+  const encoded=stable(value);
+  if(Buffer.byteLength(encoded,'utf8')>MAX_REPLAY_REPLY)
+    throw new AgentError('DURABLE_STEP_TOO_LARGE','Named durable step value exceeds '+MAX_REPLAY_REPLY+' bytes; store a result handle instead.');
+  execution.namedSteps??={};
+  if(Object.keys(execution.namedSteps).length>=64&&!execution.namedSteps[key])
+    throw new AgentError('DURABLE_STEP_LIMIT','At most 64 named durable steps are retained per Code Mode execution.');
+  const storedAt=Date.now(),digest=hash(encoded);
+  execution.namedSteps[key]={value,storedAt,digest};
+  execution.touchedAt=storedAt;
+  await harnessStateStore.put('execution',execution.id,execution);
+  await trace.event('named_step_saved',{detail:{name:key,digest}});
+  return {saved:true,name:key,storedAt,digest};
 }
 
 export async function beforeToolCall(ctx:HarnessLifecycleContext,trace:WorkflowTrace):Promise<HarnessLifecycleResult>{
@@ -385,6 +418,13 @@ export async function autoSaveSuccessfulWorkflow(source:string,toolNames:string[
     description:'Successful Code Mode workflow using '+[...new Set(toolNames)].slice(0,12).join(', '),
     tags:['automatic','code-mode'],source,automatic:true,tools:[...new Set(toolNames)],
   });
+}
+export async function selectSavedWorkflow(query:string){
+  const hits=await searchSnippets(query,3);
+  if(!hits.length||hits[0].score<4)return null;
+  if(hits[1]&&hits[1].score===hits[0].score)return null;
+  const record=await getSnippet(hits[0].id);
+  return record?{...record,matchScore:hits[0].score}:null;
 }
 
 const ROLE_TOOLS:Record<string,Set<string>>={

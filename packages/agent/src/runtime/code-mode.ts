@@ -29,12 +29,17 @@ import {
   createFiber,getFiber,updateFiber,listFibers,roundTripAcceleratorStatus,
 } from './roundtrip-accelerator.js';
 import {codeModeScheduler,type CodeModeLease} from './code-mode-scheduler.js';
+import {inferProjectAffinity} from './project-affinity.js';
+import {readOnlyCoalescer} from './read-only-coalescer.js';
+import {circuitBreakers} from './circuit-breakers.js';
+import {classifyHeavyCodeModeTask,heavyTaskPolicyStatus} from './heavy-task-policy.js';
+import {systemPressureStatus} from './system-pressure.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
-type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow';name?:unknown;args?:unknown;query?:unknown};
+type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow'|'parallel';name?:unknown;args?:unknown;query?:unknown};
 type RpcReply = {ok:boolean;value?:unknown;error?:{code:string;message:string}};
-type Step = {tool:string;outcome:'ok'|'error'|'pending'|'uncertain';durationMs:number;errorCode?:string;jobId?:string;outputTruncated?:boolean;attempts?:number;replayed?:boolean;role?:string};
+type Step = {tool:string;outcome:'ok'|'error'|'pending'|'uncertain';durationMs:number;errorCode?:string;jobId?:string;outputTruncated?:boolean;attempts?:number;replayed?:boolean;role?:string;coalesced?:boolean;parked?:boolean;projectKey?:string;autoEscalated?:boolean;escalationReason?:string};
 type WorkerMessage =
   |{type:'rpc';id:number;request:RpcRequest}
   |{type:'done';value:unknown}
@@ -58,6 +63,7 @@ export const CODE_MODE_ALLOWED_TOOLS=new Set([
   'project_context','project_map','context_pack','code_graph','lsp_query',
   'write_file','edit_block','edit_files','apply_patch','create_directory','move_file','delete_file',
   'run_command','discover_checks','run_project_checks',
+  'worker_tasks','worker_patch','worker_integrate',
   'spawn_job','get_job','wait_jobs','cancel_job','run_parallel',
   'start_process','read_process_output','interact_with_process','list_sessions',
   'git_status','git_diff','git_log',
@@ -66,6 +72,18 @@ export const CODE_MODE_ALLOWED_TOOLS=new Set([
 ]);
 
 const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
+  {
+    name:'parallel_safe',
+    description:'Run a bounded DAG of agent-verified read-only tools concurrently inside Code Mode. The runtime rejects mutations/stateful cursor tools and adapts fanout to live machine pressure.',
+    inputSchema:{type:'object',required:['calls'],properties:{
+      calls:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{
+        tool:{type:'string'},args:{type:'object'},depends_on:{type:'array',items:{type:'integer',minimum:0}}
+      }}},
+      max_concurrency:{type:'integer',minimum:1,maximum:3},
+      timeout_ms:{type:'integer',minimum:1000,maximum:100000},
+      output_chars:{type:'integer',minimum:200,maximum:16000}
+    }},annotations:{readOnlyHint:true}
+  },
   {
     name:'semantic_project_search',
     description:'LOCAL semantic/hybrid project search with a persistent 64 MiB oldest-first cache. Use for natural-language code discovery before broad file reads.',
@@ -170,6 +188,10 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
 ];
 
+const PARALLEL_SAFE_STATEFUL_DENY=new Set([
+  'start_search','get_more_search_results','stop_search','list_searches',
+  'get_job','wait_jobs','read_process_output','list_sessions','agent_status',
+]);
 const MAX_TOOL_TEXT=36_000;
 const MAX_TOOL_RESPONSE=65_000;
 const MAX_FINAL_RESPONSE=48_000;
@@ -350,14 +372,67 @@ export async function executeCodeMode(
     const stepStart=Date.now();
     activeTool=true;
     let attempts=0;
+    let coalesced=false;
+    let parked=false;
+    let projectKey:string|undefined;
+    let autoEscalated=false;
+    let escalationReason:string|undefined;
     try{
-      const invoke=()=>parent
-        ?withCallContext({...parent,id:execution.id+':'+prepared.index,signal:controller.signal,
-          depth:(parent.depth??0)+1},()=>executor(name,lifecycle.args))
-        :executor(name,lifecycle.args);
-      const executed=await executeWithSafeRetry(name,readOnly,invoke,trace);
+      projectKey=await inferProjectAffinity(lifecycle.args).catch(()=>undefined);
+      if(projectKey)await schedulerLease.setProject(projectKey,controller.signal);
+
+      const escalation=classifyHeavyCodeModeTask(name,lifecycle.args,workflowId);
+      autoEscalated=!!escalation;
+      escalationReason=escalation?.reason;
+      if(escalation)await trace.event('heavy_task_escalated',{tool:name,
+        detail:{reason:escalation.reason,label:escalation.label,projectKey}});
+      const effectiveName=escalation?'spawn_job':name;
+      const effectiveArgs=escalation?escalation.spawnArgs:lifecycle.args;
+      const rawInvoke=(signal:AbortSignal)=>parent
+        ?withCallContext({...parent,id:execution.id+':'+prepared.index,signal,
+          depth:(parent.depth??0)+1},()=>executor(effectiveName,effectiveArgs))
+        :executor(effectiveName,effectiveArgs);
+
+      const executeCore=async(sharedSignal:AbortSignal)=>{
+        const permit=circuitBreakers.before(name,lifecycle.args);
+        try{
+          const executed=await executeWithSafeRetry(name,readOnly,()=>rawInvoke(sharedSignal),trace);
+          const response=executed.result;
+          const meta=(response.structuredContent??{}) as Record<string,unknown>;
+          const errorMeta=meta.error as {code?:unknown;message?:unknown}|undefined;
+          const failureCode=typeof errorMeta?.code==='string'?errorMeta.code:undefined;
+          const failureMessage=typeof errorMeta?.message==='string'?errorMeta.message:
+            (Array.isArray(response.content)?response.content.filter(c=>c.type==='text').map(c=>c.text).join('\n').slice(0,700):undefined);
+          if(response.isError)circuitBreakers.failure(permit,failureCode,failureMessage);
+          else circuitBreakers.success(permit);
+          return executed;
+        }catch(error){
+          circuitBreakers.failure(permit,
+            typeof (error as {code?:unknown})?.code==='string'?String((error as {code?:unknown}).code):undefined,
+            error instanceof Error?error.message:undefined);
+          throw error;
+        }
+      };
+      const executeMaybeCoalesced=async()=>{
+        if(readOnlyCoalescer.eligible(name,readOnly)){
+          const joined=await readOnlyCoalescer.run(name,lifecycle.args,controller.signal,executeCore);
+          coalesced=joined.coalesced;
+          if(coalesced)await trace.event('read_coalesced',{tool:name,detail:{projectKey}});
+          return joined.value;
+        }
+        return executeCore(controller.signal);
+      };
+      const timeout=typeof lifecycle.args.timeout_ms==='number'?lifecycle.args.timeout_ms:0;
+      parked=name==='wait_jobs'||name==='run_parallel'||(name==='read_process_output'&&timeout>=250);
+      const executed=parked
+        ?await schedulerLease.parkWhile('waiting:'+name,executeMaybeCoalesced,controller.signal)
+        :await executeMaybeCoalesced();
+
       attempts=executed.attempts;
-      const response=executed.result;
+      const response:ToolResult=autoEscalated
+        ?{...executed.result,structuredContent:{...(executed.result.structuredContent??{}),
+          autoEscalated:true,originalTool:name,escalationReason}}
+        :executed.result;
       await afterToolCall({
         executionId:execution.id,traceId:trace.record.id,tool:name,args:lifecycle.args,
         readOnly,step:prepared.index,
@@ -375,19 +450,26 @@ export async function executeCodeMode(
       await durableSettleStep(execution,prepared.index,reply,attempts,trace);
       steps.push({tool:name,outcome:status,durationMs:Date.now()-stepStart,
         ...(response.isError?{errorCode:code}:{}),...(jobId?{jobId}:{}),
-        ...(truncated?{outputTruncated:true}:{}),attempts,...(role?{role}:{})});
+        ...(truncated?{outputTruncated:true}:{}),attempts,...(coalesced?{coalesced:true}:{}),
+        ...(parked?{parked:true}:{}),...(projectKey?{projectKey}:{}),
+        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),...(role?{role}:{})});
       if(pending&&jobId)pendingJobs.push(jobId);
       if(activeProjectSessionId&&projectObservations.length<64)
         projectObservations.push({tool:name,args:lifecycle.args,meta});
       return reply;
     }catch(error){
-      const uncertain=controller.signal.aborted||!readOnly;
-      const code=controller.signal.aborted?'CODE_MODE_OUTCOME_UNCERTAIN':'CODE_MODE_TOOL_FAILED';
+      const rawCode=typeof (error as {code?:unknown})?.code==='string'?String((error as {code?:unknown}).code):undefined;
+      const knownNoEffect=!!rawCode&&['CIRCUIT_OPEN','CIRCUIT_HALF_OPEN','CODE_MODE_QUEUE_TIMEOUT','CODE_MODE_RELEASED'].includes(rawCode);
+      const uncertain=controller.signal.aborted||(!readOnly&&!knownNoEffect);
+      const code=controller.signal.aborted?'CODE_MODE_OUTCOME_UNCERTAIN':(rawCode??'CODE_MODE_TOOL_FAILED');
       const reply:HarnessReply={ok:false,error:{code,message:error instanceof Error?error.message.slice(0,500):'Nested tool failed.'}};
-      await durableSettleStep(execution,prepared.index,reply,Math.max(1,attempts),trace,
+      await durableSettleStep(execution,prepared.index,reply,attempts,trace,
         uncertain?'uncertain':'error');
       steps.push({tool:name,outcome:uncertain?'uncertain':'error',
-        durationMs:Date.now()-stepStart,errorCode:code,attempts:Math.max(1,attempts),...(role?{role}:{})});
+        durationMs:Date.now()-stepStart,errorCode:code,attempts,
+        ...(coalesced?{coalesced:true}:{}),...(parked?{parked:true}:{}),
+        ...(projectKey?{projectKey}:{}),
+        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),...(role?{role}:{})});
       return reply;
     }finally{activeTool=false;}
   };
@@ -403,7 +485,7 @@ export async function executeCodeMode(
       if(request.type==='search'){
         if(typeof request.query!=='string'||request.query.length>160)
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Search query must be a short string.'}};
-        const harnessIntent=/\b(?:semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip)\b/i.test(request.query);
+        const harnessIntent=/\b(?:semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip|parallel|pressure|heavy|worker|dag|worktree|coordination)\b/i.test(request.query);
         return {ok:true,value:search(harnessIntent?discoveryCatalog:catalogView,request.query)};
       }
       const name=request.name;
@@ -414,20 +496,87 @@ export async function executeCodeMode(
         return {ok:false,error:{code:'CODE_MODE_SCHEMA_LIMIT',message:'Tool schema is too large to include in the sandbox.'}};
       return {ok:true,value:result};
     }
+    if(request.type==='parallel'){
+      if(activeTool)return {ok:false,error:{code:'CODE_MODE_NESTED_PARALLEL_DENIED',
+        message:'This Code Mode workflow already has a nested operation in flight.'}};
+      if(!request.args||typeof request.args!=='object'||Array.isArray(request.args))
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.parallelSafe requires an argument object.'}};
+      const a=request.args as Record<string,unknown>;
+      if(!Array.isArray(a.calls)||a.calls.length<1||a.calls.length>16)
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.parallelSafe requires 1-16 calls.'}};
+      const safeCalls:Array<Record<string,unknown>>=[];
+      for(let i=0;i<a.calls.length;i++){
+        const raw=a.calls[i];
+        if(!raw||typeof raw!=='object'||Array.isArray(raw))
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'parallelSafe call #'+(i+1)+' must be an object.'}};
+        const item=raw as Record<string,unknown>;
+        const tool=typeof item.tool==='string'?item.tool:'';
+        const def=names.get(tool);
+        if(!def||def.annotations?.readOnlyHint!==true||PARALLEL_SAFE_STATEFUL_DENY.has(tool))
+          return {ok:false,error:{code:'PARALLEL_SAFE_TOOL_DENIED',
+            message:'parallelSafe only accepts stateless agent-verified read-only tools; '+(tool||'call #'+(i+1))+' is not eligible.'}};
+        if(!item.args||typeof item.args!=='object'||Array.isArray(item.args))
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'parallelSafe call #'+(i+1)+' requires args object.'}};
+        const deps=Array.isArray(item.depends_on)?item.depends_on:[];
+        if(deps.some(x=>!Number.isInteger(x)||Number(x)<0||Number(x)>=i)||new Set(deps.map(Number)).size!==deps.length)
+          return {ok:false,error:{code:'INVALID_DEPENDENCY',
+            message:'parallelSafe depends_on must contain unique earlier zero-based call indices.'}};
+        safeCalls.push({tool,args:item.args,depends_on:deps.map(Number)});
+      }
+      if(calls+safeCalls.length>input.max_calls)
+        return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'parallelSafe would exceed the nested tool call budget.'}};
+      calls+=safeCalls.length-1; // runToolCall below accounts for the wrapper call.
+      const firstArgs=safeCalls[0]?.args;
+      if(firstArgs&&typeof firstArgs==='object'&&!Array.isArray(firstArgs)){
+        const projectKey=await inferProjectAffinity(firstArgs as Record<string,unknown>).catch(()=>undefined);
+        if(projectKey)await schedulerLease.setProject(projectKey,controller.signal);
+      }
+      const pressure=systemPressureStatus();
+      const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):3;
+      const maxConcurrency=Math.max(1,Math.min(3,requested,pressure.suggestedSafeParallelism));
+      const reply=await runToolCall('run_parallel',{
+        calls:safeCalls,max_concurrency:maxConcurrency,
+        timeout_ms:typeof a.timeout_ms==='number'?a.timeout_ms:Math.min(90_000,input.max_runtime_ms),
+        output_chars:typeof a.output_chars==='number'?a.output_chars:4_000,
+        retain_output:true,
+      });
+      await trace.event('parallel_safe',{detail:{calls:safeCalls.length,maxConcurrency,
+        pressure:pressure.level,ok:reply.ok}});
+      return reply;
+    }
     if(request.type==='semantic'){
       if(request.name!=='search'||!request.args||typeof request.args!=='object'||Array.isArray(request.args))
         return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.semantic.search requires an argument object.'}};
       if(++calls>input.max_calls)
         return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'Nested tool call budget exhausted.'}};
-      if(activeTool)return {ok:false,error:{code:'CODE_MODE_BUSY',message:'Nested calls must run sequentially.'}};
+      if(activeTool)return {ok:false,error:{code:'CODE_MODE_NESTED_PARALLEL_DENIED',
+        message:'This Code Mode workflow already has a nested operation in flight.'}};
       activeTool=true;
       try{
         const args=request.args as {path?:unknown;query?:unknown;limit?:unknown;refresh?:unknown};
         if(typeof args.path!=='string'||typeof args.query!=='string')
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'semantic search requires path and query strings.'}};
-        const value=await semanticSearch({path:args.path,query:args.query,
-          limit:typeof args.limit==='number'?args.limit:undefined,refresh:args.refresh===true});
-        await trace.event('semantic_search',{detail:{path:args.path,query:args.query.slice(0,160),results:value.results.length}});
+        await schedulerLease.setProject(args.path,controller.signal);
+        const safeArgs={path:args.path,query:args.query,
+          limit:typeof args.limit==='number'?args.limit:undefined,refresh:args.refresh===true};
+        const joined=await readOnlyCoalescer.run('semantic_project_search',safeArgs,controller.signal,async()=>{
+          const permit=circuitBreakers.before('semantic_project_search',safeArgs);
+          try{
+            const value=await semanticSearch(safeArgs);
+            circuitBreakers.success(permit);
+            return value;
+          }catch(error){
+            circuitBreakers.failure(permit,
+              typeof (error as {code?:unknown})?.code==='string'?String((error as {code?:unknown}).code):'SEMANTIC_SEARCH_FAILED',
+              error instanceof Error?error.message:undefined);
+            throw error;
+          }
+        });
+        if(joined.coalesced)await trace.event('read_coalesced',{tool:'semantic_project_search',
+          detail:{path:args.path}});
+        const value=joined.value;
+        await trace.event('semantic_search',{detail:{path:args.path,query:args.query.slice(0,160),
+          results:value.results.length,coalesced:joined.coalesced}});
         return {ok:true,value};
       }catch(error){
         const code=error instanceof AgentError?error.code:'SEMANTIC_SEARCH_FAILED';
@@ -504,6 +653,7 @@ export async function executeCodeMode(
             state:a.state&&typeof a.state==='object'&&!Array.isArray(a.state)?a.state as Record<string,unknown>:undefined,
           });
           activeProjectSessionId=record.id;
+          if(record.root)await schedulerLease.setProject(record.root,controller.signal);
           await trace.event('project_session_open',{detail:{id:record.id,name:record.name,root:record.root}});
           return {ok:true,value:record};
         }
@@ -513,6 +663,7 @@ export async function executeCodeMode(
           const record=await getProjectSession(id);
           if(!record)return {ok:false,error:{code:'PROJECT_SESSION_NOT_FOUND',message:'Persistent project session was not found.'}};
           activeProjectSessionId=record.id;
+          if(record.root)await schedulerLease.setProject(record.root,controller.signal);
           return {ok:true,value:record};
         }
         if(request.name==='session_update'){
@@ -521,6 +672,7 @@ export async function executeCodeMode(
             return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Project session update requires id and patch object.'}};
           const record=await updateProjectSession(id,a.patch as Record<string,unknown>);
           activeProjectSessionId=record.id;
+          if(record.root)await schedulerLease.setProject(record.root,controller.signal);
           return {ok:true,value:record};
         }
         if(request.name==='session_list')
@@ -675,7 +827,8 @@ export async function executeCodeMode(
       }
     }
     if(request.type==='harness'&&request.name==='status')
-      return {ok:true,value:{...(await harnessVNextStatus()),roundtrip:await roundTripAcceleratorStatus()}};
+      return {ok:true,value:{...(await harnessVNextStatus()),roundtrip:await roundTripAcceleratorStatus(),
+        livePressure:systemPressureStatus(),heavyTaskPolicy:heavyTaskPolicyStatus()}};
     if(request.type==='trace'&&request.name==='current')
       return {ok:true,value:trace.snapshot()};
     if(request.type==='agent'){
@@ -711,6 +864,8 @@ export async function executeCodeMode(
       if(typeof request.name!=='string'||!request.args||typeof request.args!=='object'||Array.isArray(request.args))
         return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.call requires a permitted tool name and argument object.'}};
       const virtualArgs=request.args as Record<string,unknown>;
+      if(request.name==='parallel_safe')
+        return handleRpc({type:'parallel',args:virtualArgs});
       if(request.name==='semantic_project_search')
         return handleRpc({type:'semantic',name:'search',args:virtualArgs});
       if(request.name==='saved_workflow_search'){

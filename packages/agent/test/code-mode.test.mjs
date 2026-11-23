@@ -20,6 +20,8 @@ test('Code Mode appears as a native agent tool and has a strict bounded schema',
  assert.ok(def.inputSchema.properties.source);
  assert.ok(CODE_MODE_ALLOWED_TOOLS.has('edit_files'));
  assert.ok(CODE_MODE_ALLOWED_TOOLS.has('call_plugin_tool'));
+ for(const name of ['worker_tasks','worker_patch','worker_integrate'])
+   assert.ok(CODE_MODE_ALLOWED_TOOLS.has(name),'shared worker DAG should be usable from Code Mode: '+name);
  assert.ok(!CODE_MODE_ALLOWED_TOOLS.has('set_config_value'));
  assert.ok(!CODE_MODE_ALLOWED_TOOLS.has('code_mode'),'recursive execution denied');
 });

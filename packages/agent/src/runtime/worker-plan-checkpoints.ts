@@ -30,7 +30,7 @@ export interface WorkerPlanCheckpoint {
   requiredChecks:string[];
   tasks:Array<{
     id:string;goal:string;scope:Array<{relative:string;canonical:string;key:string;directory:boolean}>;
-    dependsOn:string[];readOnly:boolean;state:'queued'|'applied';generation:number;
+    dependsOn:string[];readOnly:boolean;priority?:number;supersedes?:string[];state:'queued'|'applied'|'cancelled';generation:number;
   }>;
   baseline:[string,string][];
   appliedHashes:[string,string][];
@@ -55,7 +55,10 @@ function valid(v:unknown):v is WorkerPlanCheckpoint{
    &&t.scope.every(s=>str(s.relative,500)&&str(s.canonical,2048)&&path.isAbsolute(s.canonical)
     &&str(s.key,2048)&&typeof s.directory==='boolean')
    &&Array.isArray(t.dependsOn)&&t.dependsOn.length<=31&&t.dependsOn.every(x=>str(x,64))
-   &&typeof t.readOnly==='boolean'&&['queued','applied'].includes(t.state)
+   &&typeof t.readOnly==='boolean'
+   &&(t.priority===undefined||(Number.isInteger(t.priority)&&t.priority>=0&&t.priority<=100))
+   &&(t.supersedes===undefined||(Array.isArray(t.supersedes)&&t.supersedes.length<=31&&t.supersedes.every(x=>str(x,64))))
+   &&['queued','applied','cancelled'].includes(t.state)
    &&Number.isInteger(t.generation)&&t.generation>=0)
   &&Array.isArray(a.baseline)&&a.baseline.length<=20000
   &&a.baseline.every(pair=>Array.isArray(pair)&&pair.length===2&&str(pair[0],500)&&str(pair[1],64)&&HASH.test(pair[1]))

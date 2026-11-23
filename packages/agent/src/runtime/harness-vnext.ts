@@ -8,6 +8,9 @@ import {AgentError} from './errors.js';
 import {harnessStateStore} from './bounded-local-store.js';
 import {semanticSearchStatus} from './semantic-project-search.js';
 import {codeModeScheduler} from './code-mode-scheduler.js';
+import {readOnlyCoalescer} from './read-only-coalescer.js';
+import {circuitBreakers} from './circuit-breakers.js';
+import {projectAffinityStatus} from './project-affinity.js';
 
 const VERSION=1;
 const EXECUTION_TTL=24*60*60_000;
@@ -479,6 +482,9 @@ export async function harnessVNextStatus(){
     tracing:{maxEventsPerTrace:MAX_TRACE_EVENTS,recent:traces.map(x=>({id:x.value.id,status:x.value.status,retries:x.value.retries,replayedSteps:x.value.replayedSteps}))},
     retry:{maxAttempts:3,retryCodes:[...RETRY_CODES],mutationsAutomaticallyRetried:false},
     concurrency:codeModeScheduler.status(),
+    coalescing:readOnlyCoalescer.status(),
+    circuitBreakers:circuitBreakers.status(),
+    projectAffinity:projectAffinityStatus(),
     lifecycleHooks:['beforeToolCall','afterToolCall','onRetry','checkpoint','finish'],
     specialistAgents:specialistRoles(),
     note:'Specialist agents are isolated local execution roles using the calling AI-authored workflow and BRC tools; they do not spawn another LLM or require a relay change.',

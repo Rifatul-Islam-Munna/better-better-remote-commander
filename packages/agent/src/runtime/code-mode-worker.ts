@@ -7,7 +7,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { getQuickJS } from 'quickjs-emscripten';
 
-type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow';name?:string;args?:unknown;query?:string};
+type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow'|'parallel';name?:string;args?:unknown;query?:string};
 type RpcReply = {ok:boolean;value?:unknown;error?:{code:string;message:string}};
 type Incoming = {type:'reply';id:number;reply:RpcReply}|{type:'cancel'};
 type Inputs = {source:string;deadline:number};
@@ -111,6 +111,7 @@ async function execute():Promise<unknown>{
       ' search(query) { return __rpc({type:"search",query}); },',
       ' describe(name) { return __rpc({type:"describe",name}); },',
       ' call(name,args={}) { return name==="saved_workflow_run" ? __workflowRun(args.query,args.context||{}) : __rpc({type:"call",name,args}); },',
+      ' parallelSafe(calls,options={}) { return __rpc({type:"parallel",args:{calls,...options}}); },',
       ' step: async function(name,fn) {',
       '   if (typeof name !== "string" || typeof fn !== "function") throw new Error("tools.step(name, asyncFn) requires a name and function");',
       '   const existing = await __rpc({type:"step",name,args:{op:"get"}});',

@@ -11,7 +11,7 @@ import { checkCancelled, getCallContext } from '../context.js';
 import {sharedManifestEnabled,sharedProjectManifest} from './project-manifest.js';
 import {observeManagedChild,stopManagedChild} from './process-termination.js';
 import {spawnManaged} from './managed-spawn.js';
-export const IGNORED_DIRS = ['.git', 'node_modules', '.next', 'dist', 'build', 'coverage', '.turbo', '.venv', 'venv', '__pycache__', 'target', 'obj', '.vs', '.gradle', '.dart_tool', '.pub-cache'];
+export const IGNORED_DIRS = ['.git', '.brc-worker-worktrees', 'node_modules', '.next', 'dist', 'build', 'coverage', '.turbo', '.venv', 'venv', '__pycache__', 'target', 'obj', '.vs', '.gradle', '.dart_tool', '.pub-cache'];
 export const PreferencesSchema = z.object({
     packageManager: z.enum(['pnpm', 'npm', 'yarn', 'bun']).optional(),
     instructions: z.array(z.string().max(1000)).max(30).optional(),

@@ -10,14 +10,16 @@ const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
 const Key = z.string().min(20).max(128);
 const Check = z.string().regex(/^[A-Za-z0-9_.:-]{1,100}$/);
 const Task = z.object({ id: Id, goal: z.string().min(1).max(2000), scope: z.array(z.string().min(1).max(500)).min(1).max(16),
-    dependsOn: z.array(Id).max(31).default([]), readOnly: z.boolean().default(false) }).strict();
+    dependsOn: z.array(Id).max(31).default([]), readOnly: z.boolean().default(false),
+    priority:z.number().int().min(0).max(100).optional(),supersedes:z.array(Id).max(31).optional() }).strict();
 export const WorkerTasksSchema = z.object({
-    action: z.enum(['create', 'status', 'resume', 'claim', 'renew', 'release', 'reset', 'set_checks', 'cancel']),
+    action: z.enum(['create', 'status', 'resume', 'claim', 'renew', 'release', 'reset', 'set_checks', 'cancel_obsolete', 'capture_worktree', 'cancel']),
     path: z.string().min(1).max(2000).optional(), goal: z.string().min(1).max(2000).optional(), tasks: z.array(Task).min(1).max(32).optional(),
     hostMode: z.enum(['native_workers', 'parallel_tools', 'single']).default('single'),
     maxWorkers: z.number().int().min(1).max(10).default(3), requiredChecks: z.array(Check).max(5).optional(),
     planId: z.string().uuid().optional(), taskId: Id.optional(), workerId: z.string().min(1).max(80).regex(/^[^\x00-\x1f\x7f]+$/).optional(),
     coordinatorKey: Key.optional(), claimKey: Key.optional(), leaseSeconds: z.number().int().min(30).max(3600).default(900),
+    summary:z.string().min(1).max(4000).optional(),
     reads: z.array(z.object({ path: z.string().min(1).max(500), offset: z.number().int().min(0).default(0), length: z.number().int().min(1).max(400).default(120) }).strict()).max(16).optional(),
 }).strict();
 export const WorkerPatchSchema = z.object({ planId: z.string().uuid(), taskId: Id, claimKey: Key, submissionId: Id,
@@ -45,11 +47,11 @@ export const WORKER_TOOL_HANDLERS: Record<string, (raw: Record<string, unknown>)
 export function buildWorkerToolDefinitions(): ToolDefinition[] {
     return [
         { name: 'worker_tasks', schema: WorkerTasksSchema,
-            description: 'Optional host-native parallel coding coordination. create(path,goal,tasks with owned scope/dependsOn), status, coordinator-authorized resume (after a checkpoint is restored), claim(workerId, optional reads), renew/release, coordinator reset/set_checks/cancel. If the host truly supports spawning workers with these MCP tools, delegate ready independent tasks (prefer 2-4; max 10). Otherwise use ordinary batches or one AI; this server does not spawn models or call APIs. hostMode is caller-declared, not detection. Claims default to a 15-minute lease (max 60 minutes); renew before expiry, reclaim and reread hashes if expired. For scopes covering not-yet-created directories, use a trailing slash (e.g. src/new-feature/). Dependencies wait for integration. Keep coordinatorKey with parent. Bounded plan checkpoints are enabled by default (BRC_WORKER_PLAN_PERSIST=0 disables); they store only plans, SHA-256 coordinator-key verifier, scope and source hashes. Restored plans need resume/current-source review; worker claim keys and staged patch payloads are never saved. Scope is not an OS sandbox. Skip this tool for small single-worker edits.' },
+            description: 'Global coding DAG. create tasks with scope/dependsOn/priority/supersedes; claim steals the highest-priority ready node. Only 2+ independent writers on a clean Git root can get temporary worktreePath; edit only it, then capture_worktree. Worktrees are deleted after capture/release/cancel/expiry/finish and crash leftovers are swept on startup. Applied superseding nodes cancel obsolete downstream branches. Parent previews/applies patches and runs incremental then final checks. No model/API spawning; scope is not an OS sandbox.' },
         { name: 'worker_patch', schema: WorkerPatchSchema,
-            description: 'A claimed worker submits a proposed UTF-8 patch using planId/taskId/claimKey/submissionId, summary and up to 16 changes (same shape as workspace_batch). Exact hashes required; null means create-only. Validates owned canonical paths and current hashes, but writes NO project files. Read-only tasks submit summary and no changes. Same submissionId/payload replay is idempotent; expired/replaced claims cannot submit. 2 MiB/patch; staged patches stay in RAM. Workers must not use direct write or host-shell tools instead.' },
+            description: 'Submit a claimed task\'s staged UTF-8 patch with exact hashes; writes no shared files. Eligible worktrees should use worker_tasks capture_worktree, which converts the diff to the same staged-patch path and deletes the checkout. Read-only tasks submit findings only; replays are idempotent; 2 MiB/patch.' },
         { name: 'worker_integrate', schema: WorkerIntegrateSchema,
-            description: 'Parent-only preview/apply/verify/finish with coordinatorKey. Preview validates selected submitted tasks and returns review_sha256; apply requires that digest, rechecks hashes and commits through workspace_batch with rollback safeguards. Wait for active claims; dependencies become ready after apply. runChecks=true on final apply runs combined required checks in this call. verify runs real project checks; finish requires fresh passing evidence and no unapproved changes. Worker summaries never prove success. Successful apply retries do not rerun edits. No automatic merge, commit, model call or deployment.' },
+            description: 'Parent-only preview/apply/verify/finish. Preview returns review_sha256; apply requires it, rechecks hashes and uses guarded workspace_batch. Dependencies unlock after apply. Intermediate waves run a cheap real check; final runChecks/verify uses required checks, and finish requires fresh passing evidence with no unapproved changes. Successful apply replay never repeats edits.' },
     ].map(d => ({ name: d.name, description: d.description, inputSchema: zodToJsonSchema(d.schema),
         annotations: { title: d.name, readOnlyHint: false, destructiveHint: d.name === 'worker_integrate' } }));
 }

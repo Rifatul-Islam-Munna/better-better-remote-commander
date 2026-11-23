@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import {mkdtempSync, realpathSync} from 'node:fs';
 import path from 'node:path';
 import {tmpdir} from 'node:os';
+import {execFile} from 'node:child_process';
 const scratch=mkdtempSync(path.join(realpathSync.native(tmpdir()),'brc-workers-test-'));
 process.env.BRC_HOME=path.join(scratch,'home');process.env.BRC_LOG_LEVEL='silent';
 // This suite tests the legacy RAM-only mode. Durable restore has dedicated
@@ -13,6 +14,7 @@ process.env.BRC_WORKER_PLAN_PERSIST='0';
 const {configManager}=await import('../dist/core/config-manager.js');await configManager.setValue('allowedDirectories',[scratch]);
 const {callTool,listTools}=await import('../dist/dispatcher.js');
 const {workerCoordinator,WorkerCoordinator,WORKER_LIMITS}=await import('../dist/runtime/worker-coordination.js');
+const {cleanupRegisteredWorkerWorktrees}=await import('../dist/runtime/worker-worktrees.js');
 const {sha256}=await import('../dist/runtime/file-safety.js');
 const {withCallContext}=await import('../dist/context.js');
 const {projectIndex}=await import('../dist/runtime/project-index.js');
@@ -28,6 +30,13 @@ async function fixture(){
  await fs.writeFile(path.join(root,'src','a.cs'),'public class A {}\n');await fs.writeFile(path.join(root,'src','b.rs'),'pub fn b() {}\n');await fs.writeFile(path.join(root,'external.txt'),'untouched');
  await fs.writeFile(path.join(root,'check.cjs'),'const fs=require("node:fs"); if(fs.readFileSync("src/a.cs","utf8").includes("BAD")) process.exit(9); console.log("actual-check-ran");');
  await fs.writeFile(path.join(root,'package.json'),JSON.stringify({name:'worker-test',packageManager:'pnpm@11.24.0',scripts:{verify:'node check.cjs'}}));
+ return root;
+}
+const git=(cwd,args)=>new Promise((resolve,reject)=>execFile('git',args,{cwd,windowsHide:true},(e,stdout,stderr)=>e?reject(Object.assign(e,{stderr})):resolve(String(stdout))));
+async function gitFixture(){
+ const root=await fixture();
+ await git(root,['init','-q']);await git(root,['add','.']);
+ await git(root,['-c','user.email=brc@test.local','-c','user.name=BRC Test','commit','-qm','fixture']);
  return root;
 }
 const task=(id,scope,dependsOn=[],readOnly=false)=>({id,goal:'Implement '+id,scope,dependsOn,readOnly});
@@ -213,4 +222,129 @@ test('cancelling parallel publication waits for pending writes before rollback',
  const abort=new AbortController(),rename=fs.rename;let starts=0;
  fs.rename=async(from,to)=>{if(String(from).includes('.brc-')&&[a,b].includes(to)){starts++;if(starts===2)abort.abort(new DOMException('cancelled','AbortError'));await sleep(20);}return rename(from,to);};
  try{const r=await withCallContext({id:'cancel-parallel-publish',client:null,remote:false,signal:abort.signal},()=>callTool('workspace_batch',{path:root,dryRun:false,writeConcurrency:4,changes:[{path:'src/a.cs',expected_sha256:sha256(originalA),content:'new a'},{path:'src/b.rs',expected_sha256:sha256(originalB),content:'new b'},{path:'new-final.txt',expected_sha256:null,content:'must not be published'}]}));assert.equal(r.isError,true);assert.equal(await fs.readFile(a,'utf8'),originalA);assert.equal(await fs.readFile(b,'utf8'),originalB);assert.equal(await fs.stat(path.join(root,'new-final.txt')).catch(()=>null),null);}finally{fs.rename=rename;}
+});
+
+
+test('single-writer plans never create temporary Git worktrees',async()=>{
+ const root=await gitFixture();
+ const p=await create(root,[task('a',['src/a.cs'])],{hostMode:'native_workers'});
+ assert.equal(p.worktreeIsolation.enabled,false);
+ assert.match(p.worktreeIsolation.reason,/2\+ independent writer/i);
+ const lease=await claim(p,'a');
+ assert.equal(lease.worktreePath,undefined);
+ assert.equal(await fs.stat(path.join(root,'.brc-worker-worktrees')).catch(()=>null),null);
+ ok(await callTool('worker_tasks',{action:'release',planId:p.planId,taskId:'a',claimKey:lease.claimKey}));
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('independent multi-writer tasks use isolated worktrees, capture patches, and delete every checkout',async()=>{
+ const root=await gitFixture();
+ const p=await create(root,[task('a',['src/a.cs']),task('b',['src/b.rs'])],{hostMode:'native_workers',maxWorkers:2});
+ assert.equal(p.worktreeIsolation.enabled,true,JSON.stringify(p.worktreeIsolation));
+ assert.deepEqual(new Set(p.worktreeIsolation.writerTaskIds),new Set(['a','b']));
+ const [a,b]=await Promise.all([claim(p,'a'),claim(p,'b')]);
+ assert.ok(a.worktreePath&&b.worktreePath);
+ assert.notEqual(a.worktreePath,b.worktreePath);
+ assert.ok(await fs.stat(a.worktreePath));assert.ok(await fs.stat(b.worktreePath));
+ bad(await callTool('write_file',{path:path.join(a.worktreePath,'src','b.rs'),content:'scope escape',mode:'rewrite'}),'TASK_SCOPE_VIOLATION');
+ ok(await callTool('write_file',{path:path.join(a.worktreePath,'src','a.cs'),content:'public class WorktreeA {}\n',mode:'rewrite'}));
+ ok(await callTool('write_file',{path:path.join(b.worktreePath,'src','b.rs'),content:'pub fn worktree_b() {}\n',mode:'rewrite'}));
+ assert.doesNotMatch(await git(root,['status','--porcelain=v1']),/\.brc-worker-worktrees/);
+ const ca=ok(await callTool('worker_tasks',{action:'capture_worktree',planId:p.planId,taskId:'a',claimKey:a.claimKey,summary:'A from isolated worktree'}));
+ const cb=ok(await callTool('worker_tasks',{action:'capture_worktree',planId:p.planId,taskId:'b',claimKey:b.claimKey,summary:'B from isolated worktree'}));
+ assert.equal(ca.capturedFromWorktree,true);assert.equal(cb.capturedFromWorktree,true);
+ assert.equal(await fs.stat(a.worktreePath).catch(()=>null),null);
+ assert.equal(await fs.stat(b.worktreePath).catch(()=>null),null);
+ assert.equal(await fs.readFile(path.join(root,'src','a.cs'),'utf8'),'public class A {}\n');
+ assert.equal(await fs.readFile(path.join(root,'src','b.rs'),'utf8'),'pub fn b() {}\n');
+ assert.equal((await git(root,['status','--porcelain=v1'])).trim(),'');
+ const preview=ok(await integrate(p,'preview'));
+ const applied=ok(await integrate(p,'apply',{review_sha256:preview.review_sha256,runChecks:true}));
+ assert.equal(applied.committed,true);assert.equal(applied.checks.passed,true);
+ assert.match(await fs.readFile(path.join(root,'src','a.cs'),'utf8'),/WorktreeA/);
+ assert.match(await fs.readFile(path.join(root,'src','b.rs'),'utf8'),/worktree_b/);
+ ok(await integrate(p,'finish'));
+ assert.equal(await fs.stat(path.join(root,'.brc-worker-worktrees')).catch(()=>null),null);
+ const gitStatus=await git(root,['status','--porcelain=v1']);
+ assert.doesNotMatch(gitStatus,/\.brc-worker-worktrees/);
+ assert.match(gitStatus,/src\/a\.cs/);assert.match(gitStatus,/src\/b\.rs/);
+});
+
+test('plan cancellation deletes an active multi-writer worktree immediately',async()=>{
+ const root=await gitFixture();
+ const p=await create(root,[task('a',['src/a.cs']),task('b',['src/b.rs'])],{hostMode:'native_workers'});
+ const a=await claim(p,'a');assert.ok(a.worktreePath);
+ await fs.writeFile(path.join(a.worktreePath,'src','a.cs'),'temporary only\n');
+ const cancelled=ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+ assert.equal(cancelled.state,'cancelled');
+ assert.equal(await fs.stat(a.worktreePath).catch(()=>null),null);
+ assert.equal(await fs.stat(path.join(root,'.brc-worker-worktrees')).catch(()=>null),null);
+ assert.equal(await fs.readFile(path.join(root,'src','a.cs'),'utf8'),'public class A {}\n');
+});
+
+test('priority DAG claims support work stealing and intermediate waves run a real incremental check',async()=>{
+ const root=await fixture();
+ const p=await create(root,[
+   {...task('low',['src/b.rs'],['high']),priority:10},
+   {...task('high',['src/a.cs']),priority:90},
+ ],{maxWorkers:2});
+ const high=ok(await callTool('worker_tasks',{action:'claim',planId:p.planId,workerId:'stealer'}));
+ assert.equal(high.task.id,'high');
+ ok(await patch(p,'high',high,[await replacement(root,'src/a.cs','public class Incremental {}\n')]));
+ const preview=ok(await integrate(p,'preview',{taskIds:['high']}));
+ const applied=ok(await integrate(p,'apply',{taskIds:['high'],review_sha256:preview.review_sha256}));
+ assert.equal(applied.committed,true);
+ assert.equal(applied.incrementalChecks.passed,true);
+ assert.equal(applied.incrementalVerification.check,'verify');
+ const status=ok(await callTool('worker_tasks',{action:'status',planId:p.planId}));
+ assert.deepEqual(status.readyTaskIds,['low']);
+ const low=await claim(p,'low');
+ ok(await patch(p,'low',low,[await replacement(root,'src/b.rs','pub fn incremental_b() {}\n')]));
+ const final=ok(await applyAll(p,true));assert.equal(final.checks.passed,true);
+ ok(await integrate(p,'finish'));
+});
+
+test('applied superseding DAG node cancels obsolete alternatives and their downstream tasks',async()=>{
+ const root=await fixture();
+ const p=await create(root,[
+   {...task('winner',['src/a.cs']),priority:100,supersedes:['loser']},
+   {...task('loser',['src/b.rs']),priority:50},
+   {...task('loser-child',['external.txt'],['loser']),priority:40},
+ ]);
+ const loser=await claim(p,'loser');
+ ok(await patch(p,'loser',loser,[await replacement(root,'src/b.rs','pub fn obsolete() {}\n')]));
+ const winner=await claim(p,'winner');
+ ok(await patch(p,'winner',winner,[await replacement(root,'src/a.cs','public class Winner {}\n')]));
+ const preview=ok(await integrate(p,'preview',{taskIds:['winner']}));
+ const applied=ok(await integrate(p,'apply',{taskIds:['winner'],review_sha256:preview.review_sha256}));
+ assert.deepEqual(new Set(applied.autoCancelledObsoleteTaskIds),new Set(['loser','loser-child']));
+ const status=ok(await callTool('worker_tasks',{action:'status',planId:p.planId}));
+ assert.equal(status.tasks.find(t=>t.id==='loser').state,'cancelled');
+ assert.equal(status.tasks.find(t=>t.id==='loser-child').state,'cancelled');
+ assert.equal(await fs.readFile(path.join(root,'src/b.rs'),'utf8'),'pub fn b() {}\n');
+ const checks=ok(await integrate(p,'verify'));assert.equal(checks.checks.passed,true);
+ ok(await integrate(p,'finish'));
+});
+
+
+test('failed worktree capture still deletes the temporary checkout',async()=>{
+ const root=await gitFixture();
+ const p=await create(root,[task('a',['src/a.cs']),task('b',['src/b.rs'])],{hostMode:'native_workers'});
+ const a=await claim(p,'a');assert.ok(a.worktreePath);
+ await fs.unlink(path.join(a.worktreePath,'src','a.cs'));
+ const failed=await callTool('worker_tasks',{action:'capture_worktree',planId:p.planId,taskId:'a',claimKey:a.claimKey,summary:'delete is intentionally unsupported'});
+ bad(failed,'WORKTREE_DELETE_UNSUPPORTED');
+ assert.equal(await fs.stat(a.worktreePath).catch(()=>null),null);
+ ok(await callTool('worker_tasks',{action:'release',planId:p.planId,taskId:'a',claimKey:a.claimKey}));
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
+});
+
+test('persistent cleanup registry removes a simulated crash-leftover worktree',async()=>{
+ const root=await gitFixture();
+ const p=await create(root,[task('a',['src/a.cs']),task('b',['src/b.rs'])],{hostMode:'native_workers'});
+ const a=await claim(p,'a');assert.ok(a.worktreePath);assert.ok(await fs.stat(a.worktreePath));
+ await cleanupRegisteredWorkerWorktrees();
+ assert.equal(await fs.stat(a.worktreePath).catch(()=>null),null);
+ assert.equal(await fs.stat(path.join(root,'.brc-worker-worktrees')).catch(()=>null),null);
+ ok(await callTool('worker_tasks',{action:'cancel',planId:p.planId,coordinatorKey:p.coordinatorKey}));
 });

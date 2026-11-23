@@ -13,6 +13,7 @@ process.env.BRC_LOG_FILE='0';
 process.env.BRC_LOG_LEVEL='silent';
 process.env.BRC_ERROR_LOG='0';
 await fs.mkdir(project,{recursive:true});
+await fs.writeFile(path.join(project,'package.json'),'{}');
 
 const {configManager}=await import('../dist/core/config-manager.js');
 await configManager.setValue('allowedDirectories',[project]);
@@ -26,6 +27,7 @@ const {
 const {semanticSearch,semanticSearchStatus}=await import('../dist/runtime/semantic-project-search.js');
 const {getProjectSession,roundTripAcceleratorStatus}=await import('../dist/runtime/roundtrip-accelerator.js');
 const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
+const {systemPressureStatus}=await import('../dist/runtime/system-pressure.js');
 const {executeCodeMode}=await import('../dist/runtime/code-mode.js');
 
 after(async()=>{
@@ -318,7 +320,9 @@ test('concurrent Code Mode workflows get isolated UUIDs and obey adaptive runnab
   assert.equal(new Set(workflowIds).size,count);
   assert.equal(new Set(executionIds).size,count);
   assert.ok(maxRunning<=before.activeLimit,{maxRunning,limit:before.activeLimit});
-  if(before.activeLimit>1)assert.ok(maxRunning>=2,{maxRunning,limit:before.activeLimit});
+  // Identical safe reads may intentionally coalesce into one underlying call;
+  // workflow isolation/concurrency is verified by unique workflow/execution IDs
+  // and the scheduler/capacity tests below.
   const after=codeModeScheduler.status();
   assert.equal(after.active,0);
   assert.equal(after.queued,0);
@@ -345,6 +349,180 @@ test('Code Mode capacity queues conservatively and rejects only above the hardwa
   assert.equal(after.active,0);
   assert.equal(after.queued,0);
   assert.equal(after.admitted,0);
+});
+
+test('identical concurrent safe reads coalesce into one underlying execution',async()=>{
+  let calls=0;
+  const target=path.join(project,'shared-read.ts');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source='const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'}); return r.text;';
+  const outputs=await Promise.all([0,1].map(()=>executeCodeMode(
+    args(source,{max_runtime_ms:5000,max_calls:4}),catalog,async()=>{
+      calls++;
+      await new Promise(r=>setTimeout(r,120));
+      return text('shared-value');
+    }
+  )));
+  assert.equal(calls,1,JSON.stringify(outputs));
+  assert.ok(outputs.every(x=>x.isError===undefined));
+  assert.ok(outputs.some(x=>x.structuredContent.steps.some(s=>s.coalesced===true)));
+});
+
+test('per-project fairness caps simultaneous work from one repository',async()=>{
+  const status=codeModeScheduler.status();
+  const count=Math.min(status.admittedLimit,status.perProjectActiveLimit+2);
+  let running=0,maxRunning=0;
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const outputs=await Promise.all(Array.from({length:count},(_,i)=>{
+    const target=path.join(project,'fair-'+i+'.ts');
+    const source='const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'}); return r.text;';
+    return executeCodeMode(args(source,{max_runtime_ms:5000,max_calls:4}),catalog,async()=>{
+      running++;maxRunning=Math.max(maxRunning,running);
+      await new Promise(r=>setTimeout(r,120));
+      running--;return text('ok');
+    });
+  }));
+  assert.ok(outputs.every(x=>x.isError===undefined),JSON.stringify(outputs));
+  assert.ok(maxRunning<=status.perProjectActiveLimit,{maxRunning,limit:status.perProjectActiveLimit});
+  if(count>status.perProjectActiveLimit)assert.ok(codeModeScheduler.status().fairnessYields>=1);
+});
+
+test('parked wait-heavy workflows free a runnable slot and wake afterward',async()=>{
+  const before=codeModeScheduler.status();
+  const leases=[];
+  const prefix='park-test-'+Date.now()+'-';
+  for(let i=0;i<before.activeLimit;i++)leases.push(await codeModeScheduler.acquire(prefix+i));
+  let startedResolve;
+  const started=new Promise(r=>{startedResolve=r;});
+  let finishResolve;
+  const finish=new Promise(r=>{finishResolve=r;});
+  const parked=leases[0].parkWhile('test-wait',async()=>{startedResolve();await finish;return 'done';});
+  await started;
+  const extra=await codeModeScheduler.acquire(prefix+'extra');
+  assert.equal(codeModeScheduler.status().active,before.activeLimit);
+  assert.ok(codeModeScheduler.status().parks>=1);
+  extra.release();
+  finishResolve();
+  assert.equal(await parked,'done');
+  for(const lease of leases)lease.release();
+  const after=codeModeScheduler.status();
+  assert.equal(after.active,0);
+  assert.equal(after.parked,0);
+  assert.equal(after.queued,0);
+  assert.ok(after.wakes>=1);
+});
+
+test('repeated transient plugin failures open a circuit and stop hammering the dependency',async()=>{
+  let calls=0;
+  const plugin='circuit-test-'+Date.now();
+  const catalog=[{name:'call_plugin_tool',description:'plugin',inputSchema:{type:'object'},annotations:{readOnlyHint:false}}];
+  const source='await tools.call("call_plugin_tool",{plugin:'+JSON.stringify(plugin)+',tool:"ping",args:{}}); return "unexpected";';
+  const executor=async()=>{
+    calls++;
+    return {isError:true,content:[{type:'text',text:'plugin unavailable'}],
+      structuredContent:{error:{code:'PLUGIN_START_FAILED',message:'connection refused'}}};
+  };
+  for(let i=0;i<3;i++){
+    const out=await executeCodeMode(args(source,{max_runtime_ms:5000,max_calls:4}),catalog,executor);
+    assert.equal(out.structuredContent.status,'stopped_on_step_error',JSON.stringify(out));
+  }
+  const blocked=await executeCodeMode(args(source,{max_runtime_ms:5000,max_calls:4}),catalog,executor);
+  assert.equal(calls,3);
+  assert.equal(blocked.structuredContent.status,'stopped_on_step_error',JSON.stringify(blocked));
+  assert.equal(blocked.structuredContent.errorCode,'CIRCUIT_OPEN');
+});
+
+test('tools.parallelSafe runs only verified read-only calls through bounded run_parallel',async()=>{
+  const seen=[];
+  const catalog=[
+    {name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'write_file',description:'write',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'run_parallel',description:'parallel',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const source=[
+    'const r=await tools.parallelSafe([',
+    ' {tool:"read_file",args:{path:"a"}},',
+    ' {tool:"read_file",args:{path:"b"},depends_on:[0]}',
+    '],{max_concurrency:3});',
+    'return {total:r.structuredContent.total,max:r.structuredContent.maxConcurrency};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:8}),catalog,async(name,a)=>{
+    seen.push({name,a});
+    if(name!=='run_parallel')throw new Error('unexpected native call '+name);
+    return {content:[{type:'text',text:'parallel ok'}],
+      structuredContent:{pending:false,total:a.calls.length,maxConcurrency:a.max_concurrency}};
+  });
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(seen.length,1);
+  assert.equal(seen[0].name,'run_parallel');
+  assert.equal(seen[0].a.calls.length,2);
+  assert.ok(seen[0].a.max_concurrency>=1&&seen[0].a.max_concurrency<=3);
+  assert.equal(out.structuredContent.result.total,2);
+});
+
+test('tools.parallelSafe rejects mutations before executing anything',async()=>{
+  let calls=0;
+  const catalog=[
+    {name:'write_file',description:'write',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'run_parallel',description:'parallel',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const source='await tools.parallelSafe([{tool:"write_file",args:{path:"x",content:"y"}}]); return "bad";';
+  const out=await executeCodeMode(args(source,{max_calls:4}),catalog,async()=>{calls++;return text('wrong');});
+  assert.equal(calls,0);
+  assert.equal(out.isError,true);
+  assert.equal(out.structuredContent.error.code,'CODE_MODE_SCRIPT_FAILED');
+  assert.match(out.content[0].text,/PARALLEL_SAFE_TOOL_DENIED/);
+});
+
+test('definite heavy Code Mode commands auto-escalate to durable jobs',async()=>{
+  const calls=[];
+  const catalog=[
+    {name:'run_command',description:'command',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'spawn_job',description:'job',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const source=[
+    'const r=await tools.call("run_command",{command:"pnpm build",cwd:'+JSON.stringify(project)+'});',
+    'return {pending:r.pending,jobId:r.structuredContent.jobId,auto:r.structuredContent.autoEscalated};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:6}),catalog,async(name,a)=>{
+    calls.push({name,a});
+    if(name!=='spawn_job')throw new Error('heavy command executed directly');
+    return {content:[{type:'text',text:'PENDING job'}],
+      structuredContent:{pending:true,jobId:'job-heavy-1',status:'running'}};
+  });
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].name,'spawn_job');
+  assert.equal(calls[0].a.steps[0].tool,'run_command');
+  assert.equal(out.structuredContent.status,'pending_jobs');
+  assert.equal(out.structuredContent.result.auto,true);
+  assert.equal(out.structuredContent.steps[0].autoEscalated,true);
+  assert.equal(out.structuredContent.steps[0].jobId,'job-heavy-1');
+});
+
+test('short Code Mode commands remain direct and are not over-escalated',async()=>{
+  const calls=[];
+  const catalog=[
+    {name:'run_command',description:'command',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+    {name:'spawn_job',description:'job',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const out=await executeCodeMode(args('const r=await tools.call("run_command",{command:"git status -s"}); return r.text;'),
+    catalog,async(name,a)=>{calls.push({name,a});return text('clean');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].name,'run_command');
+  assert.equal(out.structuredContent.steps[0].autoEscalated,undefined);
+});
+
+test('live system pressure is exposed and scheduler capacity is pressure-aware',async()=>{
+  await new Promise(r=>setTimeout(r,25));
+  const pressure=systemPressureStatus();
+  const scheduler=codeModeScheduler.status();
+  assert.ok(['normal','warm','high','critical'].includes(pressure.level));
+  assert.ok(pressure.scale>0&&pressure.scale<=1);
+  assert.ok(pressure.suggestedSafeParallelism>=1&&pressure.suggestedSafeParallelism<=3);
+  assert.equal(scheduler.pressure.level,pressure.level);
+  assert.ok(scheduler.activeLimit>=1&&scheduler.activeLimit<=scheduler.hardMaxActive);
+  assert.ok(scheduler.cpu.slots<=scheduler.cpu.baseSlots);
 });
 
 test('round-trip accelerator shares the existing 30 MiB harness quota',async()=>{

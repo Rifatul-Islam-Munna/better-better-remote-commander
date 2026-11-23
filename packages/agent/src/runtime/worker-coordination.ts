@@ -12,12 +12,14 @@ import { checkCancelled } from '../context.js';
 import { sourceCandidate } from './languages.js';
 import {workerPlanCheckpointsEnabled,saveWorkerPlanCheckpoint,loadWorkerPlanCheckpoints,deleteWorkerPlanCheckpoint,
   type WorkerPlanCheckpoint} from './worker-plan-checkpoints.js';
+import {assessWorkerWorktrees,createWriterWorktree,captureWriterWorktree,cleanupWriterWorktree,
+  cleanupPlanWorktrees,workerWorktreeStatus,type WorktreeLease} from './worker-worktrees.js';
 export const WORKER_LIMITS = Object.freeze({ plans: 4, tasks: 32, maxWorkers: 10, defaultWorkers: 3, receipts: 64, appliedPaths: 512,
     patchBytes: 2 * 1024 * 1024, planPatchBytes: 8 * 1024 * 1024, totalPatchBytes: 16 * 1024 * 1024,
     idleMs: 2 * 3600000, terminalMs: 5 * 60000, leaseMs: 15 * 60000 });
 export type WorkerMode = 'native_workers' | 'parallel_tools' | 'single';
 type Change = z.infer<typeof WorkspaceChangeSchema>;
-type TaskState = 'queued' | 'claimed' | 'submitted' | 'applied';
+type TaskState = 'queued' | 'claimed' | 'submitted' | 'applied' | 'cancelled';
 type PlanState = 'active' | 'needs_review' | 'finished' | 'cancelled';
 interface Scope {
     relative: string;
@@ -31,6 +33,8 @@ export interface TaskInput {
     scope: string[];
     dependsOn?: string[];
     readOnly?: boolean;
+    priority?: number;
+    supersedes?: string[];
 }
 export interface PlanInput {
     path: string;
@@ -53,6 +57,8 @@ interface Task {
     scope: Scope[];
     dependsOn: string[];
     readOnly: boolean;
+    priority: number;
+    supersedes: string[];
     state: TaskState;
     worker?: string;
     claimHash?: string;
@@ -60,6 +66,7 @@ interface Task {
     generation: number;
     submitting: boolean;
     submission?: Submission;
+    worktree?: WorktreeLease;
     note?: string;
 }
 interface Verification {
@@ -87,6 +94,20 @@ interface Plan {
     receipts: Map<string, Record<string, unknown>>;
     receiptBytes: number;
     verification?: Verification;
+    incrementalVerification?: {
+        passed:boolean;
+        check:string;
+        at:number;
+        taskIds:string[];
+        changedPaths:string[];
+        steps:unknown[];
+    };
+    worktreeIsolation:{
+        enabled:boolean;
+        reason:string;
+        head?:string;
+        writerTaskIds:string[];
+    };
     revision: number;
     persisted?: boolean;
     restored?: boolean;
@@ -116,14 +137,32 @@ function owns(task: Task, canonical: string): boolean {
     const key = canonicalCase(path.normalize(canonical));
     return task.scope.some(s => key === s.key || (s.directory && key.startsWith(s.key + path.sep)));
 }
+function taskAncestors(tasks:Map<string,Task>,id:string,trail=new Set<string>()):Set<string>{
+    if(trail.has(id))return new Set();
+    const t=tasks.get(id);if(!t)return new Set();
+    const next=new Set(trail).add(id),out=new Set<string>();
+    for(const dep of t.dependsOn){out.add(dep);for(const a of taskAncestors(tasks,dep,next))out.add(a);}
+    return out;
+}
+function independentWriterIds(tasks:Map<string,Task>):string[]{
+    const writers=[...tasks.values()].filter(t=>!t.readOnly&&t.state!=='cancelled');
+    const ancestors=new Map(writers.map(t=>[t.id,taskAncestors(tasks,t.id)]));
+    return writers.filter(a=>writers.some(b=>a.id!==b.id&&
+        !ancestors.get(a.id)!.has(b.id)&&!ancestors.get(b.id)!.has(a.id))).map(t=>t.id);
+}
+function chooseIncrementalCheck(checks:string[]):string|undefined{
+    const score=(name:string)=>/typecheck|types/i.test(name)?0:/lint|eslint/i.test(name)?1:/check/i.test(name)?2:/unit|test/i.test(name)?3:4;
+    return [...checks].sort((a,b)=>score(a)-score(b)||a.localeCompare(b))[0];
+}
 function normalizedHashes(hashes: Map<string, string>) { return new Map([...hashes].map(([name, hash]) => [fileId(name), hash])); }
 const delegatedInstructions = [
     'Use host-native subagents only if this host can actually spawn them AND expose these BRC tools to them. Do not invent a worker or call another model/API.',
-    'Prefer 2-4 workers for independent tasks. Send planId, taskId, project root and scope; keep coordinatorKey with the parent only.',
-    'Claim a task before work. Read shared source with batch_tools/context_pack; return proposed changes through worker_patch, not direct writes or host shell commands.',
-    'Use fresh SHA-256 values, respect dependencies and renew the claim before expiry. A dependent task becomes ready only after its prerequisite is applied.',
-    'The parent previews/integrates submitted patches and runs the real combined checks. No worker-written success claim substitutes for verification.',
-    'Without native workers, process tasks with the same AI and existing batches. Parallel tool calls are not extra reasoning agents.',
+    'Prefer 2-4 workers for independent DAG nodes. Claim without taskId to steal the highest-priority ready node; keep coordinatorKey with the parent only.',
+    'Normally workers stage changes through worker_patch and never write shared source. The ONLY direct-edit exception is an explicit temporary worktreePath returned for a clean-Git, independent multi-writer task.',
+    'When worktreePath is present, edit only that checkout and call worker_tasks capture_worktree. Never edit the shared root. The checkout is temporary and is deleted after capture/release/cancel/expiry/finish.',
+    'Use fresh hashes, respect dependsOn, priority and supersedes. An applied winning node may cancel obsolete alternatives and their downstream DAG branches.',
+    'The parent previews/integrates staged patches, receives incremental check evidence between waves, and runs final combined verification. Worker success claims never substitute for real checks.',
+    'Without native workers, multiple Code Mode workflows can share this same plan; ordinary parallel tool calls are not extra reasoning agents.',
 ];
 export class WorkerCoordinator {
     private plans = new Map<string, Plan>();
@@ -151,11 +190,12 @@ export class WorkerCoordinator {
                         if(tasks.has(t.id))throw new Error('Duplicate task in checkpoint');
                         tasks.set(t.id,{
                             id:t.id,goal:t.goal,scope,dependsOn:[...t.dependsOn],
-                            readOnly:t.readOnly,state:t.state,generation:t.generation+1,
-                            submitting:false,
+                            readOnly:t.readOnly,priority:t.priority??50,supersedes:[...(t.supersedes??[])],
+                            state:t.state,generation:t.generation+1,submitting:false,
                             note:t.state==='applied'?
                                 'Previously applied; current source must be revalidated before resume.':
-                                'Previous claim/staged patch was not restored. Re-claim and re-read fresh hashes.'
+                                t.state==='cancelled'?'Previously cancelled/obsolete task remains cancelled.':
+                                'Previous claim/staged patch/worktree was not restored. Re-claim and re-read fresh hashes.'
                         });
                     }
                     const p:Plan={
@@ -164,8 +204,9 @@ export class WorkerCoordinator {
                         tasks,state:'needs_review',createdAt:record.createdAt,
                         touchedAt:this.now(),busy:false,requiredChecks:[...record.requiredChecks],
                         baseline:new Map(record.baseline),appliedHashes:new Map(record.appliedHashes),
-                        receipts:new Map(),receiptBytes:0,verification:undefined,revision:record.revision+1,
-                        persisted:true,restored:true,resumeRequired:true
+                        receipts:new Map(),receiptBytes:0,verification:undefined,incrementalVerification:undefined,
+                        worktreeIsolation:{enabled:false,reason:'Restored plans never reuse old temporary worktrees; resume re-evaluates eligibility.',writerTaskIds:independentWriterIds(tasks)},
+                        revision:record.revision+1,persisted:true,restored:true,resumeRequired:true
                     };
                     this.plans.set(p.id,p);
                 }catch{/* corrupted/unsafe checkpoint is not trusted */}
@@ -183,10 +224,10 @@ export class WorkerCoordinator {
             requiredChecks:[...p.requiredChecks],
             tasks:[...p.tasks.values()].map(t=>({
                 id:t.id,goal:t.goal,scope:t.scope.map(s=>({...s})),
-                dependsOn:[...t.dependsOn],readOnly:t.readOnly,
-                // Claims and submitted patches are intentionally volatile.
+                dependsOn:[...t.dependsOn],readOnly:t.readOnly,priority:t.priority,supersedes:[...t.supersedes],
+                // Claims, worktrees and submitted patches are intentionally volatile.
                 // A restart MUST require a new claim and fresh file hashes.
-                state:t.state==='applied'?'applied':'queued',
+                state:t.state==='applied'?'applied':t.state==='cancelled'?'cancelled':'queued',
                 generation:t.generation
             })),
             baseline:[...p.baseline.entries()],
@@ -202,8 +243,9 @@ export class WorkerCoordinator {
                 t.worker = undefined;
                 t.claimHash = undefined;
                 t.expiresAt = undefined;
+                if(t.worktree){void cleanupWriterWorktree(t.worktree);t.worktree=undefined;}
                 t.generation++;
-                t.note = 'Previous claim expired; old keys cannot submit.';
+                t.note = 'Previous claim expired; old keys cannot submit. Any temporary worktree was deleted.';
                 p.revision++;
             }
     }
@@ -215,6 +257,7 @@ export class WorkerCoordinator {
                 continue;
             const terminal = p.state === 'finished' || p.state === 'cancelled';
             if (now - p.touchedAt > (terminal ? WORKER_LIMITS.terminalMs : WORKER_LIMITS.idleMs)) {
+                void cleanupPlanWorktrees(p.root,p.id);
                 this.plans.delete(id);
                 removed++;
             }
@@ -235,12 +278,13 @@ export class WorkerCoordinator {
                 }
         }
         return { plans: this.plans.size, tasks, patches, receipts, patchBytes, estimatedRetainedBytes: patchBytes * 2 + metadataBytes,
-            limits: WORKER_LIMITS, persistent: workerPlanCheckpointsEnabled(),
+            limits: WORKER_LIMITS, persistent: workerPlanCheckpointsEnabled(),worktrees:workerWorktreeStatus(),
             restoredPlans:[...this.plans.values()].filter(p=>p.restored).length,
             pendingReview:[...this.plans.values()].filter(p=>p.resumeRequired).length,
-            spawnedModels: 0, note: 'Opt-in checkpointing stores metadata and coordinator-key verifiers only; never claim keys or patch contents. Payload budgets are not an OS-enforced RSS limit.' };
+            cancelledTasks:[...this.plans.values()].reduce((n,p)=>n+[...p.tasks.values()].filter(t=>t.state==='cancelled').length,0),
+            spawnedModels: 0, note: 'Opt-in checkpointing stores metadata and coordinator-key verifiers only; never claim keys, worktrees or patch contents. Payload budgets are not an OS-enforced RSS limit.' };
     }
-    clear() { this.plans.clear(); this.creating.clear(); this.pendingBytes.clear(); }
+    clear() { for(const p of this.plans.values())void cleanupPlanWorktrees(p.root,p.id);this.plans.clear(); this.creating.clear(); this.pendingBytes.clear(); }
     private async get(id: string): Promise<Plan> {
         await this.loadSavedPlans();
         this.prune();
@@ -277,15 +321,58 @@ export class WorkerCoordinator {
             throw new AgentError('UNKNOWN_TASK', 'Unknown task ID.');
         return t;
     }
-    private ready(p: Plan, t: Task) { return t.dependsOn.every(id => p.tasks.get(id)?.state === 'applied'); }
+    private ready(p: Plan, t: Task) { return t.state!=='cancelled'&&t.dependsOn.every(id => p.tasks.get(id)?.state === 'applied'); }
+    private async cancelTasks(p:Plan,ids:string[],reason:string){
+        const targets=new Set(ids);
+        let changed=true;
+        while(changed){
+            changed=false;
+            for(const t of p.tasks.values()){
+                if(t.state==='applied'||t.state==='cancelled'||targets.has(t.id))continue;
+                if(t.dependsOn.some(d=>targets.has(d))){targets.add(t.id);changed=true;}
+            }
+        }
+        const cancelled:string[]=[],alreadyApplied:string[]=[];
+        for(const id of targets){
+            const t=this.task(p,id);
+            if(t.state==='applied'){alreadyApplied.push(id);continue;}
+            if(t.state==='cancelled')continue;
+            if(t.worktree){await cleanupWriterWorktree(t.worktree);t.worktree=undefined;}
+            t.claimHash=undefined;t.worker=undefined;t.expiresAt=undefined;t.submission=undefined;
+            t.state='cancelled';t.generation++;t.note=reason;
+            cancelled.push(id);
+        }
+        if(cancelled.length){
+            p.verification=undefined;p.incrementalVerification=undefined;p.revision++;
+        }
+        return {cancelled,alreadyApplied};
+    }
+    private async runIncrementalVerification(p:Plan,taskIds:string[],changedPaths:string[]){
+        const remaining=[...p.tasks.values()].some(t=>t.state!=='applied'&&t.state!=='cancelled');
+        const check=remaining?chooseIncrementalCheck(p.requiredChecks):undefined;
+        if(!check||!changedPaths.length)return undefined;
+        const {runProjectChecks}=await import('./harness.js');
+        const data=await runProjectChecks(p.root,[check],true) as Record<string,unknown>;
+        const steps=Array.isArray(data.steps)?data.steps:[];
+        p.incrementalVerification={passed:data.passed===true,check,at:this.now(),taskIds:[...taskIds],
+            changedPaths:[...changedPaths],steps};
+        return data;
+    }
     private view(p: Plan) {
         const tasks = [...p.tasks.values()].map(t => ({ id: t.id, goal: t.goal, scope: t.scope.map(s => s.relative), readOnly: t.readOnly,
-            dependsOn: t.dependsOn, ready: t.state === 'queued' && this.ready(p, t), state: t.state, worker: t.worker, expiresAt: t.expiresAt,
+            priority:t.priority,supersedes:t.supersedes,dependsOn: t.dependsOn, ready: t.state === 'queued' && this.ready(p, t), state: t.state, worker: t.worker, expiresAt: t.expiresAt,
             generation: t.generation, submissionId: t.submission?.id, patchFiles: t.submission?.changes.length ?? 0,
+            worktree:t.worktree?{path:t.worktree.path,temporary:true}:undefined,
             summary: t.submission?.summary, note: t.note }));
+        const liveTasks=tasks.filter(t=>t.state!=='cancelled');
         return { planId: p.id, root: p.root, goal: p.goal, state: p.state, revision: p.revision, hostMode: p.mode,
             hostModeSource: 'caller-declared, not verified by MCP', maxWorkers: p.maxWorkers, tasks,
-            readyTaskIds: tasks.filter(t => t.ready).map(t => t.id), requiredChecks: p.requiredChecks,
+            readyTaskIds: tasks.filter(t => t.ready).sort((a,b)=>b.priority-a.priority||a.id.localeCompare(b.id)).map(t => t.id),
+            graph:{total:tasks.length,active:liveTasks.length,cancelled:tasks.length-liveTasks.length,
+                queued:liveTasks.filter(t=>t.state==='queued').length,claimed:liveTasks.filter(t=>t.state==='claimed').length,
+                submitted:liveTasks.filter(t=>t.state==='submitted').length,applied:liveTasks.filter(t=>t.state==='applied').length},
+            requiredChecks: p.requiredChecks,incrementalVerification:p.incrementalVerification,
+            worktreeIsolation:p.worktreeIsolation,
             verification: p.verification, verificationFreshness: 'Use worker_integrate finish to recheck current files; status alone does not validate fresh source.',
             persistent: !!p.persisted, restored:!!p.restored, resumeRequired:!!p.resumeRequired,
             resumePolicy: p.resumeRequired?
@@ -328,6 +415,7 @@ export class WorkerCoordinator {
                     scope.push({ relative, canonical, key: await lockKey(canonical), directory: !!stat?.isDirectory() || plannedDirectory });
                 }
                 tasks.set(input.id, { id: input.id, goal: input.goal, scope, dependsOn: [...new Set(input.dependsOn ?? [])], readOnly: !!input.readOnly,
+                    priority:Math.max(0,Math.min(100,input.priority??50)),supersedes:[...new Set(input.supersedes??[])],
                     state: 'queued', generation: 0, submitting: false });
             }
             const ancestors = new Map<string, Set<string>>();
@@ -351,6 +439,11 @@ export class WorkerCoordinator {
             };
             for (const id of tasks.keys())
                 visit(id);
+            for(const task of tasks.values())for(const other of task.supersedes){
+                if(other===task.id)throw new AgentError('INVALID_SUPERSEDES','A task cannot supersede itself.');
+                if(!tasks.has(other))throw new AgentError('UNKNOWN_SUPERSEDED_TASK',`Unknown superseded task ${other}.`);
+                if(task.dependsOn.includes(other))throw new AgentError('INVALID_SUPERSEDES','A task cannot both depend on and supersede the same task.');
+            }
             const writers = [...tasks.values()].filter(t => !t.readOnly);
             for (let i = 0; i < writers.length; i++)
                 for (const other of writers.slice(i + 1)) {
@@ -365,14 +458,23 @@ export class WorkerCoordinator {
                     throw new AgentError('UNKNOWN_CHECK', `No discovered check named ${name}.`);
             const baseline = await sourceFingerprint(root);
             checkCancelled();
+            const writerTaskIds=independentWriterIds(tasks);
+            const worktreeAssessment=writerTaskIds.length>=2
+                ?await assessWorkerWorktrees(root)
+                :{enabled:false,reason:'Worktree isolation is only used for 2+ independent writer tasks.'};
             const coordinatorKey = secret();
             const p: Plan = { id: randomUUID(), root, goal: a.goal, mode: a.hostMode ?? 'single', maxWorkers: Math.min(10, Math.max(1, a.maxWorkers ?? 3)),
                 coordinatorHash: sha256(coordinatorKey), tasks, state: 'active', createdAt: this.now(), touchedAt: this.now(), busy: false,
-                requiredChecks, baseline: normalizedHashes(baseline.hashes), appliedHashes: new Map(), receipts: new Map(), receiptBytes: 0, revision: 1 };
+                requiredChecks, baseline: normalizedHashes(baseline.hashes), appliedHashes: new Map(), receipts: new Map(), receiptBytes: 0,
+                verification:undefined,incrementalVerification:undefined,
+                worktreeIsolation:{enabled:worktreeAssessment.enabled,reason:worktreeAssessment.reason,
+                    head:worktreeAssessment.head,writerTaskIds},revision: 1 };
             this.plans.set(p.id, p);
             await this.checkpoint(p);
             return { ...this.view(p), coordinatorKey, instructions: delegatedInstructions, coverage: baseline.coverage,
-                next: p.mode === 'native_workers' ? 'Use this host\'s real spawn/delegate feature for ready tasks; give workers read tools plus worker_tasks/worker_patch, not direct writes or host shell. Keep coordinatorKey private to the parent.' : 'Use ordinary batches or process ready tasks with the same AI. This plan does not create reasoning agents.',
+                next: p.mode === 'native_workers'
+                    ? 'Use this host\'s real workers to claim highest-priority ready DAG nodes. Independent writers may receive temporary worktreePath; edit only it, then capture_worktree. Otherwise use worker_patch. Keep coordinatorKey with the parent.'
+                    : 'Use ordinary batches or process ready DAG nodes with the same AI. This plan does not create reasoning agents.',
                 security: 'Workflow coordination for authorized clients, not an OS sandbox. Raw terminal access retains its existing authority.' };
         }
         finally {
@@ -388,6 +490,7 @@ export class WorkerCoordinator {
         coordinatorKey?: string;
         leaseSeconds?: number;
         requiredChecks?: string[];
+        summary?: string;
         reads?: {
             path: string;
             offset?: number;
@@ -411,8 +514,14 @@ export class WorkerCoordinator {
                             'A checkpoint scope resolves to a different path. No task was resumed; recreate the plan after inspecting the project.');
                 }
                 await this.expectedTree(p);
+                await cleanupPlanWorktrees(p.root,p.id);
+                const writerTaskIds=independentWriterIds(p.tasks);
+                const assessment=writerTaskIds.length>=2
+                    ?await assessWorkerWorktrees(p.root)
+                    :{enabled:false,reason:'Worktree isolation is only used for 2+ independent writer tasks.'};
                 checkCancelled();
-                p.verification=undefined;
+                p.verification=undefined;p.incrementalVerification=undefined;
+                p.worktreeIsolation={enabled:assessment.enabled,reason:assessment.reason,head:assessment.head,writerTaskIds};
                 p.state='active';p.resumeRequired=false;p.revision++;
                 await this.checkpoint(p);
                 return {...this.view(p),
@@ -425,6 +534,8 @@ export class WorkerCoordinator {
                 throw new AgentError('WORKER_PLAN_BUSY', 'Wait for in-flight submission/integration before cancelling.', true);
             p.state = 'cancelled';
             p.verification = undefined;
+            p.incrementalVerification=undefined;
+            await cleanupPlanWorktrees(p.root,p.id);
             p.baseline.clear();
             p.appliedHashes.clear();
             p.receipts.clear();
@@ -433,6 +544,7 @@ export class WorkerCoordinator {
                 t.claimHash = undefined;
                 t.submission = undefined;
                 t.expiresAt = undefined;
+                if(t.worktree){await cleanupWriterWorktree(t.worktree);t.worktree=undefined;}
             }
             p.revision++;
             if(workerPlanCheckpointsEnabled()){
@@ -456,6 +568,7 @@ export class WorkerCoordinator {
                 checkCancelled();
                 p.requiredChecks = [...new Set(a.requiredChecks)];
                 p.verification = undefined;
+                p.incrementalVerification=undefined;
                 p.revision++;
                 await this.checkpoint(p);
                 return this.view(p);
@@ -464,17 +577,27 @@ export class WorkerCoordinator {
                 p.busy = false;
             }
         }
+        if(a.action==='cancel_obsolete'){
+            authorize(a.coordinatorKey??'',p.coordinatorHash);
+            if(!a.taskId)throw new AgentError('TASK_ID_REQUIRED','cancel_obsolete requires taskId for the obsolete branch root.');
+            const outcome=await this.cancelTasks(p,[a.taskId],'Cancelled as an obsolete DAG branch by the coordinator.');
+            await this.checkpoint(p);
+            return {...this.view(p),obsoleteCancellation:outcome};
+        }
         if (a.action === 'claim') {
             if (!a.workerId?.trim())
                 throw new AgentError('WORKER_ID_REQUIRED', 'Provide a worker label (not an authentication identity).');
             const active = [...p.tasks.values()].filter(t => t.state === 'claimed');
             if (active.length >= p.maxWorkers)
                 throw new AgentError('WORKER_CAPACITY', 'All worker slots are claimed. Submit, release, or wait for expiry; do not create a duplicate plan.', true);
-            const t = a.taskId ? this.task(p, a.taskId) : [...p.tasks.values()].find(t => t.state === 'queued' && this.ready(p, t));
+            const t = a.taskId ? this.task(p, a.taskId) : [...p.tasks.values()]
+                .filter(t => t.state === 'queued' && this.ready(p, t))
+                .sort((x,y)=>y.priority-x.priority||x.id.localeCompare(y.id))[0];
             if (!t)
                 return { planId: p.id, task: null, reason: 'No ready task. Integrate prerequisite submissions or wait for existing workers.', spawnedModels: 0 };
             if (t.state !== 'queued')
-                throw new AgentError('TASK_ALREADY_CLAIMED', 'Task is already claimed, submitted or applied.');
+                throw new AgentError(t.state==='cancelled'?'TASK_OBSOLETE':'TASK_ALREADY_CLAIMED',
+                    t.state==='cancelled'?'Task was cancelled as an obsolete DAG branch.':'Task is already claimed, submitted or applied.');
             if (!this.ready(p, t))
                 throw new AgentError('TASK_BLOCKED', 'Dependencies must be integrated before this task can be claimed.');
             const claimKey = secret();
@@ -486,7 +609,17 @@ export class WorkerCoordinator {
             t.note = undefined;
             t.submitting = true;
             p.revision++;
+            let createdWorktree:WorktreeLease|undefined;
             try {
+                if(!t.readOnly&&p.worktreeIsolation.enabled&&p.worktreeIsolation.head&&
+                    p.worktreeIsolation.writerTaskIds.includes(t.id)&&p.appliedHashes.size===0){
+                    try{
+                        createdWorktree=await createWriterWorktree(p.root,p.id,t.id,t.generation,p.worktreeIsolation.head);
+                        t.worktree=createdWorktree;
+                    }catch(error){
+                        t.note='Temporary worktree could not be created; use ordinary worker_patch staging. '+(error instanceof Error?error.message.slice(0,220):'');
+                    }
+                }
                 const reads = a.reads ?? [];
                 for (const r of reads)
                     safeRelative(r.path);
@@ -496,12 +629,16 @@ export class WorkerCoordinator {
                     snapshot = (await workspaceBatch({ path: p.root, reads, maxChars: 32000 })).structuredContent;
                 }
                 checkCancelled();
-                return { planId: p.id, root: p.root, task: { id: t.id, goal: t.goal, scope: t.scope.map(s => s.relative), readOnly: t.readOnly, dependsOn: t.dependsOn },
+                return { planId: p.id, root: p.root, task: { id: t.id, goal: t.goal, scope: t.scope.map(s => s.relative), readOnly: t.readOnly, priority:t.priority,supersedes:t.supersedes,dependsOn: t.dependsOn },
                     workerId: t.worker, claimKey, expiresAt: t.expiresAt, generation: t.generation, snapshot,
-                    instructions: 'Read/context tools may run in parallel. Do not edit shared source or run host-shell commands as a delegated worker. Submit a proposed patch with this claimKey; renew before expiresAt (default 15 minutes; max 60). If a claim expired, re-claim and re-read fresh hashes; never blindly resubmit. Parent integrates and verifies.',
+                    ...(t.worktree?{worktreePath:t.worktree.path,worktreeTemporary:true,worktreeHead:t.worktree.head}:{}),
+                    instructions: t.worktree
+                        ?'This is an independent multi-writer task. Edit ONLY worktreePath, never the shared root. When done call worker_tasks capture_worktree with this claimKey, submissionId and summary. The temporary worktree is deleted after capture, release, cancellation, expiry or plan finish.'
+                        :'Read/context tools may run in parallel. Do not edit shared source as a delegated worker. Submit a proposed worker_patch with this claimKey; renew before expiresAt. If a claim expired, re-claim and re-read fresh hashes.',
                     persistent: false, spawnedModels: 0 };
             }
             catch (error) {
+                if(createdWorktree){await cleanupWriterWorktree(createdWorktree);t.worktree=undefined;}
                 t.state = 'queued';
                 t.claimHash = undefined;
                 t.worker = undefined;
@@ -518,11 +655,29 @@ export class WorkerCoordinator {
         const t = this.task(p, a.taskId);
         if (t.submitting)
             throw new AgentError('TASK_BUSY', 'Task submission/snapshot is still being processed.', true);
+        if(a.action==='capture_worktree'){
+            authorize(a.claimKey??'',t.claimHash);
+            if(t.state!=='claimed'||!t.worktree)
+                throw new AgentError('WORKTREE_NOT_ACTIVE','This task has no active temporary worktree. Claim an eligible independent writer task first.');
+            if(!a.summary)
+                throw new AgentError('INVALID_ARGUMENT','capture_worktree requires summary.');
+            const lease=t.worktree;
+            try{
+                const captured=await captureWriterWorktree(lease);
+                const submitted=await this.submit({planId:p.id,taskId:t.id,claimKey:a.claimKey??'',
+                    submissionId:'worktree-'+t.id+'-'+t.generation,summary:a.summary,changes:captured.changes as Change[]});
+                return {...submitted,capturedFromWorktree:true,capturedFiles:captured.files,capturedBytes:captured.bytes,
+                    worktreeDeleted:true};
+            }finally{
+                await cleanupWriterWorktree(lease);
+                if(t.worktree?.path===lease.path)t.worktree=undefined;
+            }
+        }
         if (a.action === 'reset') {
             authorize(a.coordinatorKey ?? '', p.coordinatorHash);
             const depends = (id: string): boolean => this.task(p, id).dependsOn.some(d => d === t.id || depends(d));
-            if ([...p.tasks.values()].some(other => other.id !== t.id && other.state !== 'queued' && depends(other.id)))
-                throw new AgentError('DEPENDENTS_ACTIVE', 'Reset downstream tasks first. Their work may depend on this task.');
+            if ([...p.tasks.values()].some(other => other.id !== t.id && !['queued','cancelled'].includes(other.state) && depends(other.id)))
+                throw new AgentError('DEPENDENTS_ACTIVE', 'Reset downstream active/applied tasks first. Cancelled obsolete tasks do not block reset.');
         }
         else {
             authorize(a.claimKey ?? '', t.claimHash);
@@ -537,14 +692,16 @@ export class WorkerCoordinator {
         }
         if (!['release', 'reset'].includes(a.action))
             throw new AgentError('INVALID_ACTION', 'Unknown task action.');
+        if(t.worktree){await cleanupWriterWorktree(t.worktree);t.worktree=undefined;}
         t.state = 'queued';
         t.claimHash = undefined;
         t.worker = undefined;
         t.expiresAt = undefined;
         t.submission = undefined;
         t.generation++;
-        t.note = 'Claim released; previously applied files were not reverted.';
+        t.note = 'Claim released/reset; any temporary worktree was deleted. Previously applied files were not reverted.';
         p.verification = undefined;
+        p.incrementalVerification=undefined;
         p.revision++;
         await this.checkpoint(p);
         return this.view(p);
@@ -669,8 +826,8 @@ export class WorkerCoordinator {
         return snapshot;
     }
     private async verify(p: Plan) {
-        if ([...p.tasks.values()].some(t => t.state !== 'applied'))
-            throw new AgentError('TASKS_INCOMPLETE', 'Apply all tasks before combined verification.');
+        if ([...p.tasks.values()].some(t => t.state !== 'applied' && t.state !== 'cancelled'))
+            throw new AgentError('TASKS_INCOMPLETE', 'Apply all non-obsolete tasks before combined verification.');
         if (!p.requiredChecks.length)
             throw new AgentError('NO_VERIFICATION_DEFINED', 'Set actual discovered checks with worker_tasks set_checks before verification/finish.');
         await this.expectedTree(p);
@@ -707,8 +864,8 @@ export class WorkerCoordinator {
         let committed = false, mutationStarted = false;
         try {
             if (a.action === 'finish') {
-                if ([...p.tasks.values()].some(t => t.state !== 'applied'))
-                    throw new AgentError('TASKS_INCOMPLETE', 'Some tasks are not applied.');
+                if ([...p.tasks.values()].some(t => t.state !== 'applied' && t.state !== 'cancelled'))
+                    throw new AgentError('TASKS_INCOMPLETE', 'Some non-obsolete tasks are not applied.');
                 if (!p.verification?.passed || !p.requiredChecks.every(c => p.verification!.checks.includes(c)))
                     throw new AgentError('VERIFICATION_REQUIRED', 'Run actual combined project checks; worker summaries cannot prove success.');
                 const current = await this.expectedTree(p);
@@ -718,6 +875,7 @@ export class WorkerCoordinator {
                 }
                 p.state = 'finished';
                 p.revision++;
+                await cleanupPlanWorktrees(p.root,p.id);
                 return result({ ...this.view(p), busy: false, verifiedCurrentSource: true, coverage: current.coverage,
                     note: 'Only selected checks and the covered source snapshot are verified. No automatic commit, deployment or guarantee of full correctness.' });
             }
@@ -733,6 +891,9 @@ export class WorkerCoordinator {
             selected.sort((x, y) => x.id.localeCompare(y.id));
             if (selected.some(t => t.state !== 'submitted' || !t.submission))
                 throw new AgentError('TASK_NOT_SUBMITTED', 'Every selected task must have a submitted patch/result.');
+            const selectedIds=new Set(selected.map(t=>t.id));
+            if(selected.some(t=>t.supersedes.some(id=>selectedIds.has(id))))
+                throw new AgentError('SUPERSEDED_SELECTED','Do not integrate a winning task and a task it supersedes in the same wave.');
             const digest = sha256(JSON.stringify({ planId: p.id, tasks: selected.map(t => [t.id, t.generation, t.submission!.id, t.submission!.digest]), checks: p.requiredChecks }));
             if (a.action === 'apply' && (!a.review_sha256 || a.review_sha256 !== digest))
                 throw new AgentError('STALE_REVIEW', 'Preview current submissions and use its review_sha256.');
@@ -746,8 +907,8 @@ export class WorkerCoordinator {
             if (new Set([...p.appliedHashes.keys(), ...changes.map(c => fileId(c.path))]).size > WORKER_LIMITS.appliedPaths)
                 throw new AgentError('APPLIED_PATH_LIMIT', 'One worker plan is limited to 512 changed paths. Finish or cancel it before creating another.');
             if (a.runChecks) {
-                if ([...p.tasks.values()].some(t => t.state !== 'applied' && !selected.includes(t)))
-                    throw new AgentError('TASKS_INCOMPLETE', 'Combined checks require the final integration wave.');
+                if ([...p.tasks.values()].some(t => t.state !== 'applied' && t.state !== 'cancelled' && !selected.includes(t)))
+                    throw new AgentError('TASKS_INCOMPLETE', 'Combined checks require the final non-obsolete integration wave.');
                 if (!p.requiredChecks.length)
                     throw new AgentError('NO_VERIFICATION_DEFINED', 'Configure discovered project checks first.');
                 const { runProjectChecks } = await import('./harness.js');
@@ -784,7 +945,9 @@ export class WorkerCoordinator {
             }[];
             for (const entry of written)
                 p.appliedHashes.set(fileId(path.relative(p.root, entry.path)), entry.afterSha256);
+            const autoCancelled:string[]=[];
             for (const t of selected) {
+                if(t.worktree){await cleanupWriterWorktree(t.worktree);t.worktree=undefined;}
                 t.state = 'applied';
                 t.claimHash = undefined;
                 t.worker = undefined;
@@ -793,10 +956,16 @@ export class WorkerCoordinator {
                     t.submission.bytes = 0;
                 }
             }
+            for(const t of selected)if(t.supersedes.length){
+                const cancelled=await this.cancelTasks(p,t.supersedes,`Superseded by applied task ${t.id}.`);
+                autoCancelled.push(...cancelled.cancelled);
+            }
             p.verification = undefined;
+            p.incrementalVerification=undefined;
             p.revision++;
-            const receipt: Record<string, unknown> = { planId: p.id, review_sha256: digest, appliedTaskIds: selected.map(t => t.id), committed: true,
-                changes: written, replay: false, persistent: false, note: 'Patches applied. A failing check does not undo code; never blindly resubmit an already committed integration.' };
+            const receipt: Record<string, unknown> = { planId: p.id, review_sha256: digest, appliedTaskIds: selected.map(t => t.id),
+                autoCancelledObsoleteTaskIds:[...new Set(autoCancelled)],committed: true,
+                changes: written, replay: false, persistent: false, note: 'Patches applied. Obsolete superseded branches were cancelled. A failing check does not undo code; never blindly resubmit an already committed integration.' };
             p.receipts.set(digest, receipt);
             p.receiptBytes += Buffer.byteLength(JSON.stringify(receipt));
             while (p.receipts.size > WORKER_LIMITS.receipts) {
@@ -808,6 +977,10 @@ export class WorkerCoordinator {
                 const checks = await this.verify(p);
                 return result({ ...receipt, checks, verification: p.verification }, !checks.passed);
             }
+            const incremental=await this.runIncrementalVerification(p,selected.map(t=>t.id),written.filter(x=>x.changed).map(x=>slash(path.relative(p.root,x.path))));
+            if(incremental)
+                return result({...receipt,incrementalChecks:incremental,incrementalVerification:p.incrementalVerification},
+                    incremental.passed!==true);
             return result(receipt);
         }
         catch (error) {
@@ -845,9 +1018,22 @@ export class WorkerCoordinator {
         if (tool === 'project_preferences' && args.action === 'set' && args.persist === true)
             targets = strings(args.path);
         for (const target of targets) {
-            const key = await lockKey(path.resolve(target));
+            const resolved=path.resolve(target);
+            let isolatedAllowed=false;
+            for(const p of live)for(const t of p.tasks.values()){
+                if(t.state!=='claimed'||!t.worktree)continue;
+                const wtRoot=path.resolve(t.worktree.path);
+                if(!inside(canonicalCase(wtRoot),canonicalCase(resolved)))continue;
+                const relative=path.relative(wtRoot,resolved);
+                const sharedEquivalent=path.resolve(p.root,relative);
+                if(!owns(t,sharedEquivalent))
+                    throw new AgentError('TASK_SCOPE_VIOLATION','Temporary worktree edits must stay inside the claimed task scope.');
+                isolatedAllowed=true;
+            }
+            if(isolatedAllowed)continue;
+            const key = await lockKey(resolved);
             if (live.some(p => inside(canonicalCase(p.root), key) || inside(key, canonicalCase(p.root))))
-                throw new AgentError('COORDINATED_WRITE_REQUIRED', 'This project has a live worker plan. Submit a worker_patch and let its coordinator use worker_integrate, or cancel the plan first.');
+                throw new AgentError('COORDINATED_WRITE_REQUIRED', 'This project has a live worker plan. Write only inside an explicitly returned task worktreePath, or submit worker_patch and let the coordinator integrate it.');
         }
     }
 }

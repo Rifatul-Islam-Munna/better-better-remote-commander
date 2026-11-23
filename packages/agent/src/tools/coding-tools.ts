@@ -53,6 +53,7 @@ import {semanticTsManager} from '../runtime/semantic-ts-host.js';
 import {lazyLanguageServer} from '../runtime/lazy-lsp.js';
 import { connectionHealth } from '../transport/connection-health.js';
 import {resultFrameTelemetry} from '../transport/result-budget.js';
+import {harnessVNextStatus} from '../runtime/harness-vnext.js';
 
 
 export async function snapshot(file:string, offset=0, length=200, charOffset?:number, charLength=50000) {
@@ -241,7 +242,7 @@ export const CODING_TOOL_HANDLERS:Record<string,(args:Record<string,unknown>)=>P
       polyglotLanguageServer:lazyLanguageServer.status(),pluginConnections:runningPluginIds().length,
       ownedChildLifecycle:managedChildStatus(),managedSpawn:managedSpawnStatus(),operationalRetention:operationalRetentionStatus(),
       note:'Counts are internal manager observations; plugins may be remote and the numbers are not a complete Windows process-tree or RSS inventory.'},
-    receipts:{...mutationReceiptStatus(),recent:await recentMutationReceipts(8)},outputSpill:outputSpillLimits(),resources:cacheStatus(),indexedProjects:projectIndex.status(),codeGraphs:codeGraph.status(),parserCache:codeCacheStatus(),logging:{mode:"500KiB-live-plus-5MiB-sanitized-tool-history",
+    receipts:{...mutationReceiptStatus(),recent:await recentMutationReceipts(8)},outputSpill:outputSpillLimits(),resources:cacheStatus(),indexedProjects:projectIndex.status(),codeGraphs:codeGraph.status(),harnessVNext:await harnessVNextStatus(),parserCache:codeCacheStatus(),logging:{mode:"500KiB-live-plus-5MiB-sanitized-tool-history",
       retainedActivity:activity.status(),toolHistory:toolHistory.getStats(),
       persistent:process.env.BRC_ERROR_LOG==='1',
       failedToolLog:{enabled:process.env.BRC_ERROR_LOG==='1',path:failureLogPath(),maxEntries:100,rotation:false,

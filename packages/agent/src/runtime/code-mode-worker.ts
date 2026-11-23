@@ -7,7 +7,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { getQuickJS } from 'quickjs-emscripten';
 
-type RpcRequest = {type:'call'|'search'|'describe';name?:string;args?:unknown;query?:string};
+type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace';name?:string;args?:unknown;query?:string};
 type RpcReply = {ok:boolean;value?:unknown;error?:{code:string;message:string}};
 type Incoming = {type:'reply';id:number;reply:RpcReply}|{type:'cancel'};
 type Inputs = {source:string;deadline:number};
@@ -102,7 +102,19 @@ async function execute():Promise<unknown>{
       'const tools = Object.freeze({',
       ' search(query) { return __rpc({type:"search",query}); },',
       ' describe(name) { return __rpc({type:"describe",name}); },',
-      ' call(name,args={}) { return __rpc({type:"call",name,args}); }',
+      ' call(name,args={}) { return __rpc({type:"call",name,args}); },',
+      ' semantic: Object.freeze({ search(args) { return __rpc({type:"semantic",name:"search",args}); } }),',
+      ' snippets: Object.freeze({',
+      '   search(query,limit=10) { return __rpc({type:"snippet",name:"search",query,args:{limit}}); },',
+      '   get(id) { return __rpc({type:"snippet",name:"get",args:{id}}); },',
+      '   save(args) { return __rpc({type:"snippet",name:"save",args}); }',
+      ' }),',
+      ' agent: Object.freeze({',
+      '   run(args) { return __rpc({type:"agent",name:"run",args}); },',
+      '   roles() { return __rpc({type:"agent",name:"roles",args:{}}); }',
+      ' }),',
+      ' harness: Object.freeze({ status() { return __rpc({type:"harness",name:"status",args:{}}); } }),',
+      ' trace: Object.freeze({ current() { return __rpc({type:"trace",name:"current",args:{}}); } })',
       '});',
     ].join('\n');
 

@@ -43,6 +43,7 @@ import { repeatFailureGuard } from './runtime/repeat-guard.js';
 import {executeToolKernel,attachExecutionOutcome,classifyExecution,trackExecutionOutcome,type ExecutionKind} from './runtime/execution-kernel.js';
 import {requireSourceObservation,sourceObservationMode,automaticSourcePrecondition} from './runtime/source-observations.js';
 import {compactDuplicatedToolText} from './runtime/result-presentation.js';
+import {invalidateSemanticProject} from './runtime/semantic-project-search.js';
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => Promise<unknown>;
@@ -232,6 +233,10 @@ function safeCommandDiagnostic(cause:unknown):string{
 const MUTATIONS = new Set(['write_file','edit_block','delete_file','move_file','create_directory','write_pdf']);
 const RECEIPT_ONLY_MUTATIONS=new Set(['edit_files','apply_patch','workspace_batch','edit_code_ranges','replace_symbol',
   'worker_patch','worker_integrate','call_plugin_tool','code_mode','git_stage','git_commit','git_push']);
+const SEMANTIC_INVALIDATING_MUTATIONS=new Set([
+  'write_file','edit_block','delete_file','move_file','create_directory',
+  'edit_files','apply_patch','workspace_batch','edit_code_ranges','replace_symbol','worker_integrate'
+]);
 let readOnlyToolCache:Set<string>|null=null;
 function executionKindForTool(name:string):ExecutionKind{
   if(MUTATIONS.has(name))return 'filesystem_mutation';
@@ -322,6 +327,7 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
       // Invalidate after a failed/uncertain write too. A partial mutation
       // might have changed a file even if no successful reply was returned.
       if(kind==='filesystem_mutation'){projectIndex.invalidate();codeGraph.invalidate();}
+      if(SEMANTIC_INVALIDATING_MUTATIONS.has(name))invalidateSemanticProject();
     }
     if(out.isError && !out.structuredContent?.error){out={...out,structuredContent:{...out.structuredContent,error:{code:'TOOL_FAILED',retryable:false,callId:parent.id}}};}
 

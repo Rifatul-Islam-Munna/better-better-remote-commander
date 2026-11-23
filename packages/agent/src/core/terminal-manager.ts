@@ -91,13 +91,13 @@ export function outputSinceSnapshot(
  * The cap also bounds the join() cost in snapshot reads and the periodic
  * process-state scan, both of which are O(total output).
  */
-// Keep a small rolling terminal-output buffer in every profile. Large builds
-// can run for a long time, but only the newest 500 KiB of text is retained.
-export const MAX_BUFFERED_OUTPUT_CHARS = 500 * 1024;
-export const MAX_BUFFERED_OUTPUT_BYTES = 500 * 1024;
+// Keep a bounded rolling terminal-output buffer in every profile. Large builds
+// can run for a long time, but only the newest 1 MiB of text is retained.
+export const MAX_BUFFERED_OUTPUT_CHARS = 1024 * 1024;
+export const MAX_BUFFERED_OUTPUT_BYTES = 1024 * 1024;
 const MAX_LINE_CHARS = 8 * 1024;
-// No line-count truncation: lots of short build lines can fit inside 500 KiB.
-// Agent's interactive activity console retains a bounded share of 500 KiB of UTF-8 activity text.
+// No line-count truncation: lots of short build lines can fit inside 1 MiB.
+// Agent's interactive activity console has its own separate 1 MiB UTF-8 budget.
 export const MAX_VISIBLE_TERMINAL_LINES = Number.POSITIVE_INFINITY;
 /** Keep the latest bounded text for the initial start_process response. */
 /** Return the largest valid UTF-8 suffix within a hard byte budget.
@@ -125,13 +125,13 @@ export function keepRecentTerminalOutput(previous:string,chunk:string):string {
   const incoming=utf8Tail(chunk,budget);
   return utf8Tail(previous,budget-Buffer.byteLength(incoming,'utf8'))+incoming;
 }
-const MAX_WAIT_OUTPUT_CHARS = 500 * 1024;
+const MAX_WAIT_OUTPUT_CHARS = 1024 * 1024;
 // Only one interactive terminal process is allowed at a time. It can keep
 // running while read_process_output and other lightweight agent tools proceed.
 const MAX_ACTIVE_TERMINALS = 1;
-// Retain only a few completed sessions; each session is individually capped at 500 KiB.
+// Retain only a few completed sessions; each session is individually capped at 1 MiB.
 const MAX_COMPLETED_TERMINALS = 4;
-const MAX_COMPLETED_CHARS = 2 * 1024 * 1024;
+const MAX_COMPLETED_CHARS = 4 * 1024 * 1024;
 
 // Result type for paginated output reading
 export interface PaginatedOutputResult {
@@ -652,12 +652,12 @@ export class TerminalManager {
       lastIndex++;
     }
 
-    // Retain as many lines as fit within the 500-KiB responsive text budget;
+    // Retain as many lines as fit within the 1-MiB responsive text budget;
     // do not silently discard useful compiler/build lines just to show 20.
     // Evict old lines in one batch, avoiding O(n^2) shifts on chatty output.
     let droppedLines = 0, droppedChars = 0, droppedBytes = 0;
     // UTF-16 character limits alone allow multi-byte output to exceed the
-    // advertised 500 KiB cap. Enforce both bounds without scanning all
+    // advertised 1 MiB cap. Enforce both bounds without scanning all
     // retained lines for every incoming stdout/stderr chunk.
     while ((session.bufferedChars - droppedChars > MAX_BUFFERED_OUTPUT_CHARS ||
             session.bufferedBytes - droppedBytes > MAX_BUFFERED_OUTPUT_BYTES) &&

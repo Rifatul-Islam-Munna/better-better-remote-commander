@@ -336,7 +336,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 start(creds);
 // Local O(1) heartbeat: no network polling, no disk log and no sensitive args.
 // Mirrors MyMCP's concise status counters while keeping the retained payload
-// strictly within the 500-KiB ActivityLog budget.
+// strictly within the 1-MiB ActivityLog budget.
 heartbeatTimer=setInterval(()=>{
   if(shuttingDown||settingsOpen)return;
   const live=activity.status();

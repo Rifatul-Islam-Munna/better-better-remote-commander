@@ -13,7 +13,7 @@ import {createHash,createCipheriv,createDecipheriv,randomBytes,hkdfSync} from 'n
 import {homeDir,loadCredentials} from '../transport/pairing.js';
 const ID=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FILE=/^[a-f0-9]{64}\.json$/,MAX_ITEMS=12,MAX_BYTES=8*1024*1024;
-const TTL=24*60*60*1000,MAX_CONTENT=500*1024,MAX_DISK=740*1024;
+const TTL=24*60*60*1000,MAX_CONTENT=1024*1024,MAX_DISK=1400*1024;
 type JournalState='running'|'completed'|'interrupted';
 export interface TerminalSnapshot{
  sessionId:string;pid:number;startedAt:number;endedAt?:number;

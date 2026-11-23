@@ -3,11 +3,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 export const RETENTION_MS = 0;
-/** At most 500 KiB of RETAINED diagnostic UTF-8 payload across history and stdout queue.
+/** At most 1 MiB of RETAINED diagnostic UTF-8 payload across history and stdout queue.
  * JS objects, buffers and the Node runtime consume additional physical RAM.
- * Native terminal scrollback needs no duplicate in-agent 500-KiB ring.
+ * Native terminal scrollback needs no duplicate in-agent 1-MiB ring.
  */
-export const MAX_ACTIVITY_LOG_BYTES = 500 * 1024;
+export const MAX_ACTIVITY_LOG_BYTES = 1024 * 1024;
 export const MAX_ACTIVITY_QUEUE_BYTES = 40 * 1024;
 /** Additional fixed reservation for the disk history writer (pending + in-flight). */
 export const MAX_HISTORY_WRITER_QUEUE_BYTES = 32 * 1024;
@@ -290,7 +290,7 @@ export class ActivityLog {
             line = line.split('\n').map(part => '\x1b['+code+'m'+part+'\x1b[0m').join('\n');
         }
         // Native terminal scrollback already owns visible history. Holding
-        // another full ring here duplicated 500 KiB with no rendering benefit.
+        // another full ring here duplicated 1 MiB with no rendering benefit.
         const queuedLine=line+'\n';
         this.consoleQueue.push(queuedLine);
         this.queuedBytes += Buffer.byteLength(queuedLine, 'utf8');
@@ -319,7 +319,7 @@ export class ActivityLog {
         if (!this.rollingConsole || this.rollingTimer || this.blocked || this.consolePauses ||
             !stdoutAvailable || process.stdout.destroyed) return;
         // Coalesce short bursts. Never clear the terminal screen: native
-        // scrollback keeps older activity accessible without redrawing 500 KiB.
+        // scrollback keeps older activity accessible without redrawing 1 MiB.
         this.rollingTimer=setTimeout(() => {
             this.rollingTimer=null;
             if (!this.rollingConsole || this.blocked || this.consolePauses ||

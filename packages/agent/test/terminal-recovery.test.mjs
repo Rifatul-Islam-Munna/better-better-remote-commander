@@ -54,9 +54,9 @@ test('running CLI process returns a stable session ID, encrypted journal and ind
  const repeated=await callTool('read_process_output',{session_id:id,cursor:0,length:10,timeout_ms:0});
  assert.equal(repeated.structuredContent.nextCursor,output.structuredContent.nextCursor);
 });
-test('500 KiB journal cap evicts oldest lines without any unbounded source buffer',async()=>{
+test('1 MiB journal cap evicts oldest lines without any unbounded source buffer',async()=>{
  const id=randomUUID();
- const lines=Array.from({length:150},(_,i)=>'line'+i+'_'+('X'.repeat(6000)));
+ const lines=Array.from({length:220},(_,i)=>'line'+i+'_'+('X'.repeat(6000)));
  assert.equal(await saveTerminalSnapshot({sessionId:id,pid:1234,startedAt:Date.now(),
   state:'completed',exitCode:0,evictedLines:2,lines}),true);
  const restored=await loadTerminalSnapshot(id);

@@ -177,8 +177,8 @@ test('hard agent crash after durable start is recovered uncertain, never automat
  assert.equal(await fs.stat(out).catch(()=>null),null);
 });
 
-test('multibyte terminal output obeys a real 500 KiB UTF-8 budget, not a UTF-16 character count',{timeout:15000},async()=>{
- const code="process.stdout.write('漢'.repeat(290000));";
+test('multibyte terminal output obeys a real 1 MiB UTF-8 budget, not a UTF-16 character count',{timeout:15000},async()=>{
+ const code="process.stdout.write('漢'.repeat(500000));";
  const started=await terminalManager.executeCommand('node -e "'+code+'"',1200);
  assert.ok(started.pid>0,JSON.stringify(started));
  let snapshot;
@@ -191,12 +191,12 @@ test('multibyte terminal output obeys a real 500 KiB UTF-8 budget, not a UTF-16 
  const buffer=snapshot.lines.join('\n');
  const bytes=Buffer.byteLength(buffer,'utf8');
  assert.ok(bytes<=MAX_BUFFERED_OUTPUT_CHARS+8192,
-   'terminal buffer is char-bounded but exceeded 500 KiB in UTF-8 bytes: '+bytes);
+   'terminal buffer is char-bounded but exceeded 1 MiB in UTF-8 bytes: '+bytes);
 });
 
-test('initial output tail preserves valid astral characters within a 500 KiB byte cap',()=>{
+test('initial output tail preserves valid astral characters within a 1 MiB byte cap',()=>{
  const tail=keepRecentTerminalOutput('🚀'.repeat(300000),'a');
- assert.ok(Buffer.byteLength(tail,'utf8')<=500*1024);
+ assert.ok(Buffer.byteLength(tail,'utf8')<=1024*1024);
  assert.equal(tail.endsWith('a'),true);
  assert.equal(/[\ud800-\udfff]/.test(tail.replace(/🚀/g,'')),false,
   'output trim left a dangling UTF-16 surrogate');
@@ -204,7 +204,7 @@ test('initial output tail preserves valid astral characters within a 500 KiB byt
  let rolling='';
  for(let i=0;i<45;i++)
   rolling=keepRecentTerminalOutput(rolling,'漢'.repeat(18000));
- assert.ok(Buffer.byteLength(rolling,'utf8')<=500*1024);
+ assert.ok(Buffer.byteLength(rolling,'utf8')<=1024*1024);
  assert.equal(rolling.endsWith('漢'.repeat(18000)),true);
 });
 
@@ -221,7 +221,7 @@ test('astral UTF-8 stream preserves surrogate boundaries when wrapping long line
  assert.equal(page?.isComplete,true);
  assert.ok(page.lines.length>5);
  const all=page.lines.join('\n');
- assert.ok(Buffer.byteLength(all,'utf8')<=500*1024+4);
+ assert.ok(Buffer.byteLength(all,'utf8')<=1024*1024+4);
  for(const line of page.lines){
   if(!line.length)continue;
   const first=line.charCodeAt(0),last=line.charCodeAt(line.length-1);

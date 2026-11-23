@@ -1,4 +1,4 @@
-/** Lightweight console labels and status screens; activity retains at most 500 KiB of log payload. */
+/** Lightweight console labels and status screens; activity retains at most 1 MiB of log payload. */
 import { MAX_ACTIVITY_CONSOLE_BYTES, formatActivityEvent, type ActivityEvent } from './runtime/activity.js';
 
 export interface AgentTerminal {
@@ -66,7 +66,7 @@ export function connectionPanel(
       + '\n  Ping     '+seconds(h.heartbeatAgeMs)
       + '\n  Last close '+(h.lastDisconnectCode??'none')
       + '\n  Results  '+h.droppedToolResults+' dropped/replaced result(s)' : '')
-    + '\n  Storage  500 KiB live activity + bounded, sanitized local tool-history JSONL\n';
+    + '\n  Storage  1 MiB live activity + bounded, sanitized local tool-history JSONL\n';
 }
 
 export function recentActivity(events: ActivityEvent[], max = 50,

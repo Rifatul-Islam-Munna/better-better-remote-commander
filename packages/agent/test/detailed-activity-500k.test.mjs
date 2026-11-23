@@ -20,8 +20,8 @@ test('detailed timestamped start and completion logs include call ID and safe di
  assert.doesNotMatch(a+b,/Sensitive raw output/);
 });
 
-test('bounded activity stays under 500 KiB even with detailed output paused',async()=>{
- assert.equal(MAX_ACTIVITY_LOG_BYTES,500*1024);
+test('bounded activity stays under 1 MiB even with detailed output paused',async()=>{
+ assert.equal(MAX_ACTIVITY_LOG_BYTES,1024*1024);
  assert.equal(MAX_ACTIVITY_EVENT_BYTES+MAX_ACTIVITY_QUEUE_BYTES+32*1024,MAX_ACTIVITY_LOG_BYTES);
  const log=new ActivityLog(undefined,false);
  log.setConsoleMode('detailed');
@@ -34,7 +34,7 @@ test('bounded activity stays under 500 KiB even with detailed output paused',asy
  assert.equal(stats.started,7000);
  assert.equal(stats.finished,7000);
  assert.equal(stats.failed,0);
- assert.ok(stats.retainedBytes<=500*1024,stats.retainedBytes);
+ assert.ok(stats.retainedBytes<=1024*1024,stats.retainedBytes);
  assert.ok(stats.historyBytes<=MAX_ACTIVITY_EVENT_BYTES);
  assert.ok(stats.queueBytes<=MAX_ACTIVITY_QUEUE_BYTES);
  assert.equal(log.rollingLines,undefined);
@@ -47,14 +47,14 @@ test('30-second heartbeat is status-only and has a bounded log budget',()=>{
  assert.equal(LOG_HEARTBEAT_INTERVAL_MS,30_000);
  const line=formatHeartbeat({online:true,connecting:false,inFlight:2},
    {finished:120,failed:5,lastTool:'edit_block',retainedBytes:128*1024,
-    maxRetainedBytes:500*1024,dropped:17});
+    maxRetainedBytes:1024*1024,dropped:17});
  assert.match(line,/Heartbeat \| ONLINE \| active 2/);
  assert.match(line,/completed 120 \| errors 5/);
- assert.match(line,/log 128\/500 KiB/);
+ assert.match(line,/log 128 KiB\/1 MiB/);
  assert.match(line,/evicted 17/);
  const unsafe=formatHeartbeat({online:false,connecting:false,inFlight:0},
    {finished:0,failed:0,lastTool:'password=hidden',retainedBytes:0,
-    maxRetainedBytes:500*1024,dropped:0});
+    maxRetainedBytes:1024*1024,dropped:0});
  assert.doesNotMatch(unsafe,/hidden/);
 });
 

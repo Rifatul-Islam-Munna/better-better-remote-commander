@@ -136,19 +136,19 @@ test('safe rewrite remains atomic and preserves source bytes', async () => {
   assert.equal(await fs.readFile(file,'utf8'),'replacement\r\n');
 });
 
-test('terminal session keeps all lines up to 500 KiB, then evicts only by size', async () => {
+test('terminal session keeps all lines up to 1 MiB, then evicts only by size', async () => {
   const {TerminalManager, MAX_BUFFERED_OUTPUT_CHARS, MAX_VISIBLE_TERMINAL_LINES} = await import('../dist/core/terminal-manager.js');
-  assert.equal(MAX_BUFFERED_OUTPUT_CHARS,500*1024);
+  assert.equal(MAX_BUFFERED_OUTPUT_CHARS,1024*1024);
   assert.equal(MAX_VISIBLE_TERMINAL_LINES,Number.POSITIVE_INFINITY);
   const mgr = new TerminalManager();
   const session = {
     outputLines:[], bufferedChars:0, evictedChars:0, evictedLines:0,
     lastReadIndex:0, pid:1,
   };
-  for(let i=0;i<7;i++) mgr.appendToLineBuffer(session,('record-'+i+':'+('x'.repeat(80))+'\n').repeat(1400));
+  for(let i=0;i<10;i++) mgr.appendToLineBuffer(session,('record-'+i+':'+('x'.repeat(80))+'\n').repeat(1400));
   assert.ok(session.bufferedChars<=MAX_BUFFERED_OUTPUT_CHARS,session.bufferedChars);
   assert.ok(session.outputLines.length>20, session.outputLines.length);
-  assert.ok(session.outputLines.some(line=>line.startsWith('record-6:')));
+  assert.ok(session.outputLines.some(line=>line.startsWith('record-9:')));
   assert.ok(session.outputLines.every(line=>!line.startsWith('record-0:')));
   assert.ok(session.evictedChars>0);
   assert.ok(session.evictedLines>0);
@@ -173,10 +173,10 @@ test('start_process path completes a simple native command without shell persist
   assert.equal(mgr.listActiveSessions().length,0);
 });
 
-test('activity history stays within its share of the combined 500-KiB log budget', async () => {
+test('activity history stays within its share of the combined 1-MiB log budget', async () => {
   const {ActivityLog,MAX_ACTIVITY_LOG_BYTES,MAX_ACTIVITY_EVENT_BYTES} = await import('../dist/runtime/activity.js');
   const {recentActivity} = await import('../dist/terminal-ui.js');
-  assert.equal(MAX_ACTIVITY_LOG_BYTES, 500 * 1024);
+  assert.equal(MAX_ACTIVITY_LOG_BYTES, 1024 * 1024);
   const log = new ActivityLog(path.join(scratch,'quiet-activity'),true);
   for (let i=0;i<7000;i++) log.tool('OK','read_file',String(i),i);
   const recent=log.recent();
@@ -192,15 +192,15 @@ test('activity history stays within its share of the combined 500-KiB log budget
   await log.close();
 });
 
-test('initial command output keeps every line until its 500-KiB text cap', async () => {
+test('initial command output keeps every line until its 1-MiB text cap', async () => {
   const {keepRecentTerminalOutput} = await import('../dist/core/terminal-manager.js');
   let tail='';
   for(let i=0;i<160;i++) tail=keepRecentTerminalOutput(tail,'line-'+i+'\n');
   assert.ok(tail.split('\n').length>20);
   assert.ok(tail.includes('line-0\n'));
   assert.ok(tail.includes('line-159\n'));
-  const large=keepRecentTerminalOutput(tail, 'x'.repeat(520*1024)+'END');
-  assert.equal(large.length,500*1024);
+  const large=keepRecentTerminalOutput(tail, 'x'.repeat(1100*1024)+'END');
+  assert.equal(large.length,1024*1024);
   assert.ok(large.endsWith('END'));
   assert.ok(!large.includes('line-0\n'));
 });
@@ -253,7 +253,7 @@ test('completed 350-KiB command output survives in memory for read_process_outpu
   assert.ok(result.lines.join('').length>=350000,'output should not be lost on completion');
 });
 
-test('native scrollback uses no duplicate in-agent ring within the 500-KiB budget', async () => {
+test('native scrollback uses no duplicate in-agent ring within the 1-MiB activity budget', async () => {
   const {ActivityLog,MAX_ACTIVITY_CONSOLE_BYTES} = await import('../dist/runtime/activity.js');
   const log = new ActivityLog(path.join(scratch, 'rolling-activity'),false);
   // Exercise the console buffer without drawing terminal screens during tests.
@@ -265,12 +265,12 @@ test('native scrollback uses no duplicate in-agent ring within the 500-KiB budge
   const stats=log.status();
   assert.ok(stats.historyBytes>20*1024,'retained events are available without a second ring');
   assert.ok(stats.retainedBytes<=stats.maxRetainedBytes);
-  assert.equal(stats.maxRetainedBytes,500*1024);
+  assert.equal(stats.maxRetainedBytes,1024*1024);
   assert.equal(log.recent().at(-1).tool,'read_file');
   await log.close();
 });
 
-test('paused console queue stays within its share of the 500-KiB log budget', async () => {
+test('paused console queue stays within its share of the 1-MiB log budget', async () => {
   const {ActivityLog,MAX_ACTIVITY_CONSOLE_BYTES} = await import('../dist/runtime/activity.js');
   const log = new ActivityLog(path.join(scratch, 'queue-activity'),false);
   const resume = log.pauseConsole();

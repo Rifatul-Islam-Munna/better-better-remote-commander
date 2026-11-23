@@ -28,9 +28,11 @@ export function formatHeartbeat(connection:HeartbeatSnapshot,stats:HeartbeatLogS
  const last=typeof stats.lastTool==='string'&&/^[a-z0-9_-]{1,80}$/i.test(stats.lastTool)
    ?stats.lastTool:'none';
  const current=Math.ceil(Math.max(0,stats.retainedBytes)/1024);
- const maximum=Math.floor(stats.maxRetainedBytes/1024);
+ const maximum=stats.maxRetainedBytes>=1024*1024&&stats.maxRetainedBytes%(1024*1024)===0
+   ?(stats.maxRetainedBytes/(1024*1024))+' MiB'
+   :Math.floor(stats.maxRetainedBytes/1024)+' KiB';
  return 'Heartbeat | '+status+' | active '+Math.max(0,connection.inFlight)+
    ' | completed '+stats.finished+' | errors '+stats.failed+
-   ' | last '+last+' | log '+current+'/'+maximum+' KiB'+
+   ' | last '+last+' | log '+current+' KiB/'+maximum+
    (stats.dropped>0?' | evicted '+stats.dropped:'');
 }

@@ -1,4 +1,4 @@
-import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS } from '../terminal-manager.js';
+import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS, MAX_BUFFERED_OUTPUT_BYTES } from '../terminal-manager.js';
 import {loadTerminalSnapshot,terminalJournalStatus} from '../../runtime/terminal-journal.js';
 import { commandManager } from '../command-manager.js';
 import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, ForceTerminateArgsSchema, ListSessionsArgsSchema } from './schemas.js';
@@ -239,7 +239,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
       text: `Process started with PID ${result.pid} (session: ${stableSessionId??'unavailable'}, shell: ${shellUsed})\n${shellChoice.reason?'Shell selection: '+shellChoice.reason+'\n':''}Initial output:\n${result.output}${dropped>0?'\n[EARLIER OUTPUT DISCARDED: '+dropped+' lines; redirect the command to a file if full logs are needed.]':''}${statusMessage}${timingMessage}`
     }],
     structuredContent:{pid:result.pid,sessionId:stableSessionId,
-      outputBufferBytes:500*1024,terminalJournal:terminalJournalStatus(),
+      outputBufferBytes:MAX_BUFFERED_OUTPUT_BYTES,terminalJournal:terminalJournalStatus(),
       processStarted:true,processMayStillBeRunning:result.isBlocked}
   };
 }
@@ -295,7 +295,7 @@ async function recoveredTerminalOutput(sessionId:string,cursor:number|undefined,
    processState:state,exitConfirmed:state==='completed',exitCode:saved.exitCode,
    requestedCursor:requested,oldestAvailableCursor:oldest,nextCursor,hasMore,
    lostOutput:requested<oldest,evictedLines:oldest,
-   readCount:selected.length,bufferCapBytes:500*1024,automaticProcessRetry:false}};
+   readCount:selected.length,bufferCapBytes:MAX_BUFFERED_OUTPUT_BYTES,automaticProcessRetry:false}};
 }
 export async function readProcessOutput(args: unknown): Promise<ServerResult> {
   const parsed = ReadProcessOutputArgsSchema.safeParse(args);
@@ -461,7 +461,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
       exitCode:result.exitCode??null,requestedCursor:cursor??null,
       oldestAvailableCursor,nextCursor,lostOutput,evictedLines:result.evictedLines??0,
       readCount:result.readCount,hasMore:result.remaining>0,
-      bufferCapBytes:500*1024,automaticProcessRetry:false}
+      bufferCapBytes:MAX_BUFFERED_OUTPUT_BYTES,automaticProcessRetry:false}
   };
 }
 

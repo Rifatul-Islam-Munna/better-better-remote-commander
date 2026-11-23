@@ -54,7 +54,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'Sandboxed JavaScript function body ending with return. Use tools.search/describe/call to discover native and harness capabilities. No Node, filesystem, fetch or process globals.'),
+    'Sandboxed JavaScript body ending with return. Large/truncated results stay in Code Mode: page semantic search or query tools.results.search/get on resultHandle. No Node, filesystem, fetch or process globals.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -93,9 +93,11 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
   {
     name:'semantic_project_search',
-    description:'LOCAL semantic/hybrid project search with a persistent 64 MiB oldest-first cache. Use for natural-language code discovery before broad file reads.',
+    description:'LOCAL pageable semantic/hybrid project discovery with a persistent 64 MiB oldest-first cache. Keep discovery inside Code Mode: use small pages/preview_chars, follow continuation.next, or query local result handles instead of switching to direct fallback because output is large.',
     inputSchema:{type:'object',required:['path','query'],properties:{
-      path:{type:'string'},query:{type:'string'},limit:{type:'integer',minimum:1,maximum:30},refresh:{type:'boolean'}
+      path:{type:'string'},query:{type:'string'},limit:{type:'integer',minimum:1,maximum:30},
+      offset:{type:'integer',minimum:0,maximum:6999},preview_chars:{type:'integer',minimum:80,maximum:1200},
+      include_preview:{type:'boolean'},refresh:{type:'boolean'}
     }},annotations:{readOnlyHint:true}
   },
   {
@@ -261,7 +263,7 @@ function search(catalog:ToolDefinition[],query:string):unknown {
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score||a.def.name.localeCompare(b.def.name));
   return hits.slice(0,12).map(x=>({name:x.def.name,description:x.def.description.slice(0,180)}));
 }
-async function toolReply(result:ToolResult,label:string):Promise<{value:Record<string,unknown>;truncated:boolean}>{
+async function toolReply(result:ToolResult,label:string):Promise<{value:Record<string,unknown>;truncated:boolean;handle?:{id:string;label:string;bytes:number;originalBytes:number;partial:boolean;local:boolean;storageQuotaBytes:number}}>{
   const content=Array.isArray(result.content)?result.content:[];
   const textContent=content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
   const mediaOmitted=content.some(c=>c.type!=='text');
@@ -286,11 +288,11 @@ async function toolReply(result:ToolResult,label:string):Promise<{value:Record<s
       outputTruncated:true,mediaOmitted,resultBudget:{textChars:MAX_SOURCE_OUTPUT,adaptive:true},
       ...(handle?{resultHandle:handle}:{}),
       note:handle
-        ?'The full bounded/redacted result is retained locally. Query resultHandle for omitted detail.'
-        :'The result exceeded the Code Mode limit. Request a smaller range.'};
+        ?'The full bounded/redacted result is retained locally. Stay inside Code Mode: use tools.results.search(resultHandle.id, query) or tools.results.get(resultHandle.id,{offset,length}) for omitted detail. Do not switch to direct fallback solely because this result is large.'
+        :'The result exceeded the Code Mode limit. Stay inside Code Mode and request a smaller range/page.'};
     truncated=true;
   }
-  return {value,truncated};
+  return {value,truncated,...(handle?{handle}:{} )};
 }
 
 export async function executeCodeMode(
@@ -327,6 +329,10 @@ export async function executeCodeMode(
   const sourceLedger=new SourceObservationLedger();
   let recoveryHint:Awaited<ReturnType<typeof latestRecoveryCapsule>>=null;
   let recoveryDelivered=false;
+  const continuationHandles=new Map<string,{id:string;label:string;bytes:number;originalBytes:number;partial:boolean;local:boolean;storageQuotaBytes:number}>();
+  const consumedContinuationHandles=new Set<string>();
+  let truncatedWithoutHandle=0;
+  const semanticContinuations=new Map<string,Record<string,unknown>>();
   const catalogView=catalog.filter(t=>CODE_MODE_ALLOWED_TOOLS.has(t.name));
   const discoveryCatalog=[...catalogView,...CODE_MODE_VIRTUAL_TOOLS];
   const names=new Map(catalogView.map(t=>[t.name,t]));
@@ -385,6 +391,25 @@ export async function executeCodeMode(
     preflights:[...preflightResults.values()],verification:verificationSummary(),
     recovery:recoveryHint,sourceObservations:sourceLedger.snapshot(),outputTruncated,
   });
+  const continuationState=(finalHandle?:{id:string;label:string;bytes:number;originalBytes:number;partial:boolean;local:boolean;storageQuotaBytes:number})=>{
+    if(finalHandle)continuationHandles.set(finalHandle.id,finalHandle);
+    const handles=[...continuationHandles.values()].filter(h=>!consumedContinuationHandles.has(h.id)).slice(0,12);
+    const truncatedSteps=steps.filter(s=>s.outputTruncated).map((s,index)=>({index,tool:s.tool}));
+    const semantic=[...semanticContinuations.values()].slice(-8);
+    const required=handles.length>0||truncatedWithoutHandle>0;
+    if(!required&&!semantic.length)return null;
+    return {
+      required,stayInCodeMode:true,directFallbackRecommended:false,
+      reason:required?'large_or_truncated_local_result':'semantic_pages_available',
+      resultHandles:handles,truncatedSteps,semanticPages:semantic,
+      nextActions:[
+        'Use tools.results.search(handleId, query) to filter large local results.',
+        'Use tools.results.get(handleId,{offset,length}) to page local results.',
+        'For semantic discovery, narrow the query or follow continuation.next with offset/limit/preview_chars.',
+        'Return only the compact evidence needed by the calling AI; do not switch to direct read/edit/test tools solely because a Code Mode result was large.'
+      ],
+    };
+  };
   await checkpointRecovery('running').catch(()=>undefined);
 
   const runToolCall=async(name:string,args:Args,role?:string):Promise<RpcReply>=>{
@@ -521,7 +546,16 @@ export async function executeCodeMode(
       const code=typeof error?.code==='string'?error.code:'TOOL_FAILED';
       const jobId=typeof meta.jobId==='string'?meta.jobId:undefined;
       const status=response.isError?'error':pending?'pending':'ok';
-      const {value,truncated}=await toolReply(response,name);
+      const {value,truncated,handle}=await toolReply(response,name);
+      if(handle){
+        continuationHandles.set(handle.id,handle);
+        value.continuation={
+          required:true,stayInCodeMode:true,directFallbackRecommended:false,
+          resultHandle:handle,
+          next:'Use tools.results.search(resultHandle.id, query) to filter locally, or tools.results.get(resultHandle.id,{offset,length}) to page it. Continue the workflow inside Code Mode.'
+        };
+      }
+      if(truncated&&!handle)truncatedWithoutHandle++;
       if(projectKey&&verificationResults.has(projectKey))value.verificationEvidence=verificationResults.get(projectKey);
       if(recoveryHint&&!recoveryDelivered){value.recoveryCapsule=recoveryHint;recoveryDelivered=true;}
       const reply:HarnessReply=response.isError
@@ -643,14 +677,18 @@ export async function executeCodeMode(
         message:'This Code Mode workflow already has a nested operation in flight.'}};
       activeTool=true;
       try{
-        const args=request.args as {path?:unknown;query?:unknown;limit?:unknown;refresh?:unknown};
+        const args=request.args as {path?:unknown;query?:unknown;limit?:unknown;offset?:unknown;preview_chars?:unknown;include_preview?:unknown;refresh?:unknown};
         if(typeof args.path!=='string'||typeof args.query!=='string')
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'semantic search requires path and query strings.'}};
         rememberPaths({path:args.path});
         await schedulerLease.setProject(args.path,controller.signal);
         await ensurePreflight(args.path,'read','semantic_project_search');
         const safeArgs={path:args.path,query:args.query,
-          limit:typeof args.limit==='number'?args.limit:undefined,refresh:args.refresh===true};
+          limit:typeof args.limit==='number'?args.limit:undefined,
+          offset:typeof args.offset==='number'?args.offset:undefined,
+          preview_chars:typeof args.preview_chars==='number'?args.preview_chars:undefined,
+          include_preview:typeof args.include_preview==='boolean'?args.include_preview:undefined,
+          refresh:args.refresh===true};
         const joined=await readOnlyCoalescer.run('semantic_project_search',safeArgs,controller.signal,async()=>{
           const permit=circuitBreakers.before('semantic_project_search',safeArgs);
           try{
@@ -667,8 +705,12 @@ export async function executeCodeMode(
         if(joined.coalesced)await trace.event('read_coalesced',{tool:'semantic_project_search',
           detail:{path:args.path}});
         const value=joined.value;
+        const semanticKey=args.path+'\0'+args.query;
+        if(value.continuation)semanticContinuations.set(semanticKey,value.continuation as Record<string,unknown>);
+        else semanticContinuations.delete(semanticKey);
         await trace.event('semantic_search',{detail:{path:args.path,query:args.query.slice(0,160),
-          results:value.results.length,coalesced:joined.coalesced}});
+          results:value.results.length,offset:value.page?.offset??0,hasMore:value.page?.hasMore===true,
+          coalesced:joined.coalesced}});
         return {ok:true,value};
       }catch(error){
         const code=error instanceof AgentError?error.code:'SEMANTIC_SEARCH_FAILED';
@@ -773,9 +815,11 @@ export async function executeCodeMode(
           return {ok:true,value:await putResultHandle(a.value,typeof a.label==='string'?a.label:'result')};
         if(request.name==='result_get'){
           if(typeof a.id!=='string')return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Result handle get requires id.'}};
-          return {ok:true,value:await readResultHandle({id:a.id,
+          const value=await readResultHandle({id:a.id,
             offset:typeof a.offset==='number'?a.offset:undefined,length:typeof a.length==='number'?a.length:undefined,
-            query:typeof a.query==='string'?a.query:undefined})};
+            query:typeof a.query==='string'?a.query:undefined});
+          consumedContinuationHandles.add(a.id);
+          return {ok:true,value};
         }
         if(request.name==='result_drop'){
           if(typeof a.id!=='string')return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Result handle drop requires id.'}};
@@ -1089,6 +1133,7 @@ export async function executeCodeMode(
                 scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
                 retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
                 modelState:modelState('stopped_on_step_error'),
+                ...(continuationState()?{continuation:continuationState()}:{}),
                 automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
               },
             };
@@ -1111,10 +1156,11 @@ export async function executeCodeMode(
           const fullRendered=limited(resultValue,Number.MAX_SAFE_INTEGER);
           const finalHandle=await maybePutResultHandle(resultValue,'code_mode_final',18_000).catch(()=>null);
           const outputTruncated=fullRendered.length>MAX_FINAL_RESPONSE||!!finalHandle;
+          const continuation=continuationState(finalHandle??undefined);
           const rendered=finalHandle
-            ?adaptiveFinalText(fullRendered,18_000)+'\n[Full final result retained in local resultHandle '+finalHandle.id+'.]'
+            ?adaptiveFinalText(fullRendered,18_000)+'\n[Full final result retained in local resultHandle '+finalHandle.id+'. Continue inside Code Mode with tools.results.search/get; direct fallback is not recommended just because this output is large.]'
             :outputTruncated
-              ?fullRendered.slice(0,MAX_FINAL_RESPONSE)+'\n[CODE MODE RESULT TRUNCATED: return a smaller summary.]'
+              ?fullRendered.slice(0,MAX_FINAL_RESPONSE)+'\n[CODE MODE RESULT TRUNCATED: stay in Code Mode and return a smaller summary/page; do not switch to direct fallback solely because of size.]'
               :fullRendered;
           const pending=pendingJobs.length>0;
           const failedSteps=steps.filter(s=>s.outcome==='error'||s.outcome==='uncertain');
@@ -1125,7 +1171,8 @@ export async function executeCodeMode(
             ' | '+steps.length+' local tool call(s) | '+(Date.now()-started)+' ms'+
             (failedSteps.length?' | '+failedSteps.length+' failed/uncertain step(s)':'')+
             (unawaitedCalls?' | drained '+unawaitedCalls+' detached call(s)':'')+
-            (outputTruncated?' | final result truncated':'')+
+            (outputTruncated?' | local continuation available':'')+
+            (continuation?.required?' | stay in code_mode':'')+
             (resumed?' | durable resume':'')+
             (pending?' | inspect jobs: '+pendingJobs.join(', '):'');
           const out:ToolResult={
@@ -1140,6 +1187,7 @@ export async function executeCodeMode(
               scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
               retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
               modelState:modelState(status,outputTruncated),
+              ...(continuation?{continuation}:{}),
               storage:{harnessStateMaxBytes:30*1024*1024,semanticCacheMaxBytes:64*1024*1024},
               automaticRetry:{enabled:true,safeReadOnlyOnly:true,maxAttempts:3},
             },

@@ -135,6 +135,7 @@ async function execute():Promise<unknown>{
       ' results: Object.freeze({',
       '   store(value,label="result") { return __rpc({type:"roundtrip",name:"result_store",args:{value,label}}); },',
       '   get(id,args={}) { return __rpc({type:"roundtrip",name:"result_get",args:{id,...args}}); },',
+      '   search(id,query,args={}) { return __rpc({type:"roundtrip",name:"result_get",args:{id,query,...args}}); },',
       '   drop(id) { return __rpc({type:"roundtrip",name:"result_drop",args:{id}}); }',
       ' }),',
       ' terminal: Object.freeze({ use(args) { return __rpc({type:"roundtrip",name:"terminal",args}); } }),',

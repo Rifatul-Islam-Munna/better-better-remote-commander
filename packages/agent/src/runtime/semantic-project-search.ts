@@ -175,23 +175,38 @@ async function load(rawRoot:string,refresh=false):Promise<{record:SemanticRecord
 }
 
 export async function semanticProjectSearch(args:{
-  path:string;query:string;limit?:number;refresh?:boolean;
+  path:string;query:string;limit?:number;offset?:number;preview_chars?:number;include_preview?:boolean;refresh?:boolean;
 }){
   if(typeof args.query!=='string'||args.query.trim().length<2||args.query.length>500)
     throw new AgentError('INVALID_ARGUMENT','semantic search query must be 2-500 characters.');
   const limit=Math.max(1,Math.min(30,args.limit??10));
+  const offset=Math.max(0,Math.min(MAX_CHUNKS-1,Math.trunc(args.offset??0)));
+  const previewChars=Math.max(80,Math.min(MAX_PREVIEW,Math.trunc(args.preview_chars??500)));
+  const includePreview=args.include_preview!==false;
   const {record,rebuilt}=await load(args.path,args.refresh===true);
   const query=tokens(args.query,32);
-  const ranked=record.chunks.map(chunk=>({chunk,score:scoreChunk(chunk,query,args.query)}))
+  const all=record.chunks.map(chunk=>({chunk,score:scoreChunk(chunk,query,args.query)}))
     .filter(x=>x.score>0)
-    .sort((a,b)=>b.score-a.score||a.chunk.path.localeCompare(b.chunk.path)||a.chunk.lineStart-b.chunk.lineStart)
-    .slice(0,limit)
-    .map(({chunk,score})=>({
+    .sort((a,b)=>b.score-a.score||a.chunk.path.localeCompare(b.chunk.path)||a.chunk.lineStart-b.chunk.lineStart);
+  const totalMatches=all.length;
+  const page=all.slice(offset,offset+limit);
+  const ranked=page.map(({chunk,score})=>({
       path:chunk.path,lineStart:chunk.lineStart,lineEnd:chunk.lineEnd,
-      score:Math.round(score*100)/100,symbols:chunk.symbols.slice(0,12),preview:chunk.preview,
+      score:Math.round(score*100)/100,symbols:chunk.symbols.slice(0,12),
+      ...(includePreview?{preview:chunk.preview.length<=previewChars?chunk.preview:chunk.preview.slice(0,previewChars)+'\n…'}:{}),
     }));
+  const nextOffset=offset+ranked.length;
+  const hasMore=nextOffset<totalMatches;
   return {
-    root:record.root,query:args.query,results:ranked,index:{
+    root:record.root,query:args.query,results:ranked,
+    page:{offset,limit,returned:ranked.length,totalMatches,nextOffset:hasMore?nextOffset:null,hasMore,
+      previewChars,includePreview},
+    continuation:hasMore?{
+      stayInCodeMode:true,directFallbackRecommended:false,
+      next:{path:record.root,query:args.query,offset:nextOffset,limit,preview_chars:previewChars,include_preview:includePreview},
+      note:'Fetch the next semantic page or narrow the query inside Code Mode. Large discovery output is not a reason to switch to direct fallback tools.'
+    }:null,
+    index:{
       rebuilt,builtAt:record.builtAt,files:record.files,chunks:record.chunks.length,
       sourceBytes:record.sourceBytes,truncated:record.truncated,persistent:true,
       cacheLimitBytes:64*1024*1024,
@@ -208,7 +223,7 @@ const knownRoots=new Set<string>();
 export async function registerSemanticRoot(rawRoot:string){
   const root=await rootPath(rawRoot);knownRoots.add(root);return root;
 }
-export async function semanticSearch(args:{path:string;query:string;limit?:number;refresh?:boolean}){
+export async function semanticSearch(args:{path:string;query:string;limit?:number;offset?:number;preview_chars?:number;include_preview?:boolean;refresh?:boolean}){
   const root=await registerSemanticRoot(args.path);
   const refresh=args.refresh===true||invalidateAll;
   const result=await semanticProjectSearch({...args,path:root,refresh});

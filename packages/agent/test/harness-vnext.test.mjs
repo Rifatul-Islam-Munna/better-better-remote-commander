@@ -731,3 +731,77 @@ test('dispatcher mutation receipt chain links before/after hashes to later verif
   assert.notEqual(row.targets[0].before,row.targets[0].after);
   assert.ok(row.verificationEvidenceId,JSON.stringify(row));
 });
+
+
+test('semantic project discovery is compact, pageable, and exposes Code Mode continuation',async()=>{
+  const file=path.join(project,'semantic-paging.ts');
+  const lines=Array.from({length:180},(_,i)=>`export const semanticPageNeedle${i} = "semantic page needle value ${i}";`).join('\n')+'\n';
+  await fs.writeFile(file,lines);
+  const first=await semanticSearch({
+    path:project,query:'semantic page needle',limit:1,offset:0,preview_chars:100,refresh:true,
+  });
+  assert.equal(first.results.length,1);
+  assert.equal(first.page.offset,0);
+  assert.equal(first.page.limit,1);
+  assert.equal(first.page.hasMore,true,JSON.stringify(first.page));
+  assert.ok(first.page.totalMatches>1,JSON.stringify(first.page));
+  assert.ok(first.results[0].preview.length<=102,first.results[0].preview.length);
+  assert.equal(first.continuation.stayInCodeMode,true);
+  assert.equal(first.continuation.directFallbackRecommended,false);
+  const second=await semanticSearch(first.continuation.next);
+  assert.equal(second.page.offset,first.page.nextOffset);
+  assert.notEqual(second.results[0].lineStart,first.results[0].lineStart);
+});
+
+test('large nested result exposes unresolved stay-in-Code-Mode continuation instead of suggesting direct fallback',async()=>{
+  const target=path.join(project,'large-continuation.ts');
+  await fs.writeFile(target,'export const continuation = true;\n');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source=[
+    'const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'});',
+    'return {done:true,handle:r.resultHandle&&r.resultHandle.id,localContinuation:r.continuation&&r.continuation.stayInCodeMode};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:4}),catalog,async()=>text('needle\n'+'x'.repeat(50000)));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.result.done,true);
+  assert.equal(out.structuredContent.result.localContinuation,true);
+  assert.ok(out.structuredContent.result.handle);
+  assert.equal(out.structuredContent.continuation.required,true);
+  assert.equal(out.structuredContent.continuation.stayInCodeMode,true);
+  assert.equal(out.structuredContent.continuation.directFallbackRecommended,false);
+  assert.equal(out.structuredContent.continuation.resultHandles.length,1);
+  assert.match(out.structuredContent.continuation.nextActions.join(' '),/do not switch to direct/i);
+});
+
+test('Code Mode can resolve a large result locally with tools.results.search and clear unresolved continuation',async()=>{
+  const target=path.join(project,'large-local-search.ts');
+  await fs.writeFile(target,'export const localSearch = true;\n');
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source=[
+    'const r=await tools.call("read_file",{path:'+JSON.stringify(target)+'});',
+    'const hits=await tools.results.search(r.resultHandle.id,"UNIQUE_LOCAL_NEEDLE",{length:2000});',
+    'return {hits:hits.hits.length,first:hits.hits[0]&&hits.hits[0].text.includes("UNIQUE_LOCAL_NEEDLE")};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:4}),catalog,async()=>text('a'.repeat(32000)+'\nUNIQUE_LOCAL_NEEDLE\n'+'b'.repeat(16000)));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.ok(out.structuredContent.result.hits>=1,JSON.stringify(out.structuredContent.result));
+  assert.equal(out.structuredContent.result.first,true);
+  assert.ok(!out.structuredContent.continuation||out.structuredContent.continuation.required===false,
+    JSON.stringify(out.structuredContent.continuation));
+});
+
+test('Code Mode semantic paging can finish discovery locally without direct fallback',async()=>{
+  const file=path.join(project,'semantic-code-mode.ts');
+  const lines=Array.from({length:150},(_,i)=>`export function semanticCodeModeNeedle${i}(){ return "semantic code mode needle ${i}"; }`).join('\n')+'\n';
+  await fs.writeFile(file,lines);
+  const source=[
+    'const first=await tools.semantic.search({path:'+JSON.stringify(project)+',query:"semantic code mode needle",limit:1,preview_chars:90,refresh:true});',
+    'const second=await tools.semantic.search(first.continuation.next);',
+    'return {first:first.results[0].lineStart,second:second.results[0].lineStart,pageOffset:second.page.offset,stay:first.continuation.stayInCodeMode};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source,{max_calls:6}),[],async()=>{throw new Error('no native direct fallback expected');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(out.structuredContent.result.stay,true);
+  assert.notEqual(out.structuredContent.result.first,out.structuredContent.result.second);
+  assert.ok(out.structuredContent.result.pageOffset>0);
+});

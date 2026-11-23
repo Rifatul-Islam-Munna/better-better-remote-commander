@@ -18,8 +18,8 @@ export interface ToolChoice {
 export const TOOL_CHOICES: Record<string, ToolChoice> = {
   code_mode: {
     use: 'PRIMARY DEFAULT for multi-step work: keep reads, searches, edits, tests, project sessions, large-result filtering, reusable sessions and durable jobs local so the calling AI usually needs one remote MCP call.',
-    instead: 'Direct read/edit/command tools remain available as fallback for one simple action or when Code Mode recovery is inappropriate.',
-    caveat: 'Bounded QuickJS/WASM only. Durable replay and fibers never blindly replay uncertain mutations; direct fallback tools remain unchanged.',
+    instead: 'Use direct read/edit/command tools only for one genuinely simple action or when Code Mode is unavailable/unsupported; large or truncated Code Mode output is NOT a fallback signal.',
+    caveat: 'When continuation/resultHandle is returned, stay in Code Mode and page/filter locally with tools.results.search/get or smaller semantic pages. Durable replay never blindly replays uncertain mutations.',
   },
   get_config: {
     use: 'Inspect this BRC agent configuration and access limits.',

@@ -56,6 +56,9 @@ test('confusing neighboring tools are differentiated without claiming unsupporte
   assert.match(TOOL_CHOICES['code_diagnostics'].caveat, /never a passing typecheck/i);
   assert.match(TOOL_CHOICES['docker_inventory'].caveat, /UNKNOWN/i);
   assert.match(TOOL_CHOICES['worker_patch'].caveat, /does not apply/i);
+  assert.match(TOOL_CHOICES['code_mode'].instead,/large or truncated.*NOT a fallback signal/i);
+  assert.match(TOOL_CHOICES['code_mode'].caveat,/stay in Code Mode/i);
+  assert.match(byName.get('code_mode').description,/large or truncated Code Mode output is NOT a fallback signal/i);
 });
 
 test('tool descriptions lead with actionable next calls and enforce discovery budgets', () => {

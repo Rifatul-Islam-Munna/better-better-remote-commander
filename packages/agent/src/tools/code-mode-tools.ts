@@ -30,8 +30,8 @@ export function buildCodeModeToolDefinitions():ToolDefinition[]{
   return [{
     name:'code_mode',
     description:[
-      'USE WHEN: PRIMARY DEFAULT for multi-step coding, testing, debugging, project research and installed-plugin workflows. Multiple Code Mode workflows may run concurrently through an adaptive local scheduler while direct tools remain fallback.',
-      'USE INSTEAD: Direct read_file/edit_block/run_command for a single simple action; spawn_job for long builds.',
+      'USE WHEN: PRIMARY DEFAULT for multi-step coding, testing, debugging, project research and installed-plugin workflows. Multiple Code Mode workflows may run concurrently through an adaptive local scheduler. Large/truncated results are a LOCAL continuation signal, not a reason to abandon Code Mode.',
+      'USE INSTEAD: Direct read_file/edit_block/run_command only for a genuinely single simple action, or when Code Mode is unavailable/unsupported. Do NOT switch to direct fallback solely because semantic/tool output is large or truncated.',
       'IMPORTANT: Runs JavaScript in a bounded QuickJS/WASM sandbox ON THE PAIRED DEVICE (not the relay).',
       'The sandbox has NO Node.js process, filesystem, imports, browser, fetch or unrestricted host execution.',
       'Use tools.search/describe/call for native and local harness capabilities. tools.parallelSafe handles stateless read-only DAGs; worker_tasks/worker_patch/worker_integrate provide the shared coding DAG across Code Mode workflows, including priority, work stealing, multi-writer worktree isolation, obsolete-branch cancellation and incremental/final verification.',
@@ -44,7 +44,7 @@ export function buildCodeModeToolDefinitions():ToolDefinition[]{
       'For a long build use await tools.call("spawn_job", {command:"...",cwd:"..."}) and return the jobId;',
       'then use get_job/wait_jobs in subsequent direct MCP calls. Do not claim a pending job is complete.',
       'Never automatically repeat uncertain writes, and never use Code Mode to bypass user authorization.',
-      'Discovery and tool-result payloads are bounded; binary previews should use direct tools.',
+      'Discovery and tool-result payloads are bounded. If continuation/resultHandle appears, stay in Code Mode: use tools.results.search/get, semantic offset/limit/preview_chars, or a narrower query and return only compact evidence. Binary previews are the exception and should use direct tools.',
     ].join(' '),
     inputSchema:zodToJsonSchema(CodeModeArgsSchema),
     annotations:{title:'Code Mode (local sandbox)',readOnlyHint:false,destructiveHint:true},

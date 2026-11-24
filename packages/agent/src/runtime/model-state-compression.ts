@@ -34,6 +34,7 @@ export function compactModelState(input:{
   touchedPaths?:string[];
   preflights?:CompactPreflightLike[];
   verification?:unknown[];
+  specialist?:unknown;
   recovery?:unknown;
   sourceObservations?:unknown;
   outputTruncated?:boolean;
@@ -76,6 +77,7 @@ export function compactModelState(input:{
     touchedPaths:unique(input.touchedPaths??[],24),
     preflight:preflights,
     verification:(input.verification??[]).slice(0,8),
+    specialist:input.specialist??null,
     recovery:input.recovery??null,
     sourceObservations:input.sourceObservations??null,
     outputTruncated:input.outputTruncated===true,

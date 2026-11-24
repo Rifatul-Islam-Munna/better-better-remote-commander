@@ -147,6 +147,7 @@ async function execute():Promise<unknown>{
       ' }),',
       ' agent: Object.freeze({',
       '   run(args) { return __rpc({type:"agent",name:"run",args}); },',
+      '   specialist(args) { return __rpc({type:"agent",name:"run",args}); },',
       '   roles() { return __rpc({type:"agent",name:"roles",args:{}}); }',
       ' }),',
       ' harness: Object.freeze({ status() { return __rpc({type:"harness",name:"status",args:{}}); } }),',

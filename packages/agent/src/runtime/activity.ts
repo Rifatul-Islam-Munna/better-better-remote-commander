@@ -97,7 +97,7 @@ function localToolStamp(timestamp:string):string {
 }
 /** Parse only allowlisted, short console fields. Never render raw MCP JSON. */
 function minimalPreview(raw:string|undefined):{
-    summary?:string;detail?:string;target?:string;hint?:string
+    summary?:string;detail?:string;target?:string;hint?:string;specialist?:string;routing?:string
 } {
     if(!raw)return {};
     try {
@@ -112,6 +112,8 @@ function minimalPreview(raw:string|undefined):{
             detail:field('detail',100),
             target:field('target',115),
             hint:field('hint',125),
+            specialist:field('specialist',90),
+            routing:field('routing',16),
         };
     } catch { return {}; }
 }
@@ -146,8 +148,11 @@ export function formatActivityEvent(event: ActivityEvent, mode: ConsoleMode, wid
         const target=preview.target??(event.action?compactLine(event.action,105):undefined);
         const context=target&&target!==preview.detail
             ?'\n    Target: '+compactLine(target,Math.max(40,max-12)):'';
-        if(event.phase==='START')
-            return stamp+' 🔧 Tool call '+name+' started  '+id;
+        if(event.phase==='START'){
+            const specialist=preview.specialist?'\n    Specialist: '+compactLine(preview.specialist,90):'';
+            const routing=preview.routing?'\n    Routing: '+compactLine(preview.routing,16):'';
+            return stamp+' 🔧 Tool call '+name+' started  '+id+specialist+routing;
+        }
         const receipt='\n    Call '+id+took;
         const heading='\n    Result preview\n    ';
         const detail=preview.detail?' • '+preview.detail:'';

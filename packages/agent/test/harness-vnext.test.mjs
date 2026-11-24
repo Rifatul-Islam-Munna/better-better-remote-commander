@@ -805,3 +805,64 @@ test('Code Mode semantic paging can finish discovery locally without direct fall
   assert.notEqual(out.structuredContent.result.first,out.structuredContent.result.second);
   assert.ok(out.structuredContent.result.pageOffset>0);
 });
+
+
+test('explicit specialist alias preserves technical specialty labels',async()=>{
+  let calls=0;
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source=[
+    'const child=await tools.agent.specialist({role:"explorer",specialty:"go",task:"inspect Imagor routing",steps:[{tool:"read_file",args:{path:"worker.go"}}]});',
+    'return {specialty:child.specialty,ok:child.allSucceeded,text:child.results[0].value.text};',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async()=>{calls++;return text('go-specialist-read');});
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  assert.equal(calls,1);
+  assert.equal(out.structuredContent.result.specialty,'go');
+  assert.equal(out.structuredContent.result.ok,true);
+  assert.equal(out.structuredContent.specialistPolicy.explicitRuns,1);
+  assert.ok(out.structuredContent.specialistPolicy.specialtiesUsed.includes('go'));
+  assert.equal(out.structuredContent.steps[0].role,'explorer');
+  assert.equal(out.structuredContent.steps[0].specialty,'go');
+});
+
+test('multi-domain Code Mode auto-routes calls through inferred specialists when AI omits delegation',async()=>{
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source=[
+    '// multi-domain project: go.mod @nestjs/core pubspec.yaml',
+    'const a=await tools.call("read_file",{path:"imagor/worker.go"});',
+    'const b=await tools.call("read_file",{path:"backend/src/app.module.ts",framework:"@nestjs/core"});',
+    'const c=await tools.call("read_file",{path:"mobile/lib/main.dart",manifest:"pubspec.yaml"});',
+    'return [a.text,b.text,c.text];',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async(name,a)=>text(String(a.path)));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  const policy=out.structuredContent.specialistPolicy;
+  assert.equal(policy.required,true,JSON.stringify(policy));
+  assert.equal(policy.compliant,true,JSON.stringify(policy));
+  assert.equal(policy.autoRoutedCalls,3,JSON.stringify(policy));
+  assert.deepEqual(policy.detectedDomains.sort(),['flutter','go','nestjs']);
+  assert.ok(out.structuredContent.steps.every(s=>s.autoSpecialist===true));
+  assert.deepEqual(out.structuredContent.steps.map(s=>s.role),['explorer','explorer','explorer']);
+  assert.deepEqual(out.structuredContent.steps.map(s=>s.specialty),['go','nestjs','flutter']);
+});
+
+test('longer single-domain Code Mode automatically enables specialist routing after complexity threshold',async()=>{
+  const catalog=[{name:'read_file',description:'read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}];
+  const source=[
+    'await tools.call("read_file",{path:"a.go"});',
+    'await tools.call("read_file",{path:"b.go"});',
+    'await tools.call("read_file",{path:"c.go"});',
+    'await tools.call("read_file",{path:"d.go"});',
+    'return "done";',
+  ].join('\n');
+  const out=await executeCodeMode(args(source),catalog,async()=>text('ok'));
+  assert.equal(out.isError,undefined,JSON.stringify(out));
+  const policy=out.structuredContent.specialistPolicy;
+  assert.equal(policy.required,true,JSON.stringify(policy));
+  assert.equal(policy.autoRoutedCalls,1,JSON.stringify(policy));
+  assert.equal(out.structuredContent.steps[0].autoSpecialist,undefined);
+  assert.equal(out.structuredContent.steps[1].autoSpecialist,undefined);
+  assert.equal(out.structuredContent.steps[2].autoSpecialist,undefined);
+  assert.equal(out.structuredContent.steps[3].autoSpecialist,true);
+  assert.equal(out.structuredContent.steps[3].specialty,'go');
+});

@@ -51,8 +51,8 @@ test('a failed tool gets an actionable second line but success gets only one', (
   assert.doesNotMatch(report,/Output preview|Arguments:/);
 });
 
-test('500 KiB retained log budget avoids duplicating terminal scrollback', async () => {
-  assert.equal(MAX_ACTIVITY_LOG_BYTES,500*1024);
+test('1 MiB retained log budget avoids duplicating terminal scrollback', async () => {
+  assert.equal(MAX_ACTIVITY_LOG_BYTES,1024*1024);
   assert.equal(MAX_ACTIVITY_CONSOLE_BYTES,MAX_ACTIVITY_EVENT_BYTES);
   assert.equal(MAX_ACTIVITY_QUEUE_BYTES,40*1024);
   assert.equal(MAX_ACTIVITY_EVENT_BYTES+MAX_ACTIVITY_QUEUE_BYTES+32*1024,MAX_ACTIVITY_LOG_BYTES);

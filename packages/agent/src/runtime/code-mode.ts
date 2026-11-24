@@ -41,12 +41,13 @@ import {SourceObservationLedger} from './stale-source-guard.js';
 import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} from './recovery-capsule.js';
 import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText} from './adaptive-result-budget.js';
 import {getVerificationEvidence,isTrackedMutation,isVerificationOperation} from './verification-evidence.js';
+import {SpecialistRoutingPolicy,specialistPolicyStatus} from './specialist-policy.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
 type RpcRequest = {type:'call'|'search'|'describe'|'semantic'|'snippet'|'agent'|'harness'|'trace'|'step'|'roundtrip'|'workflow'|'parallel';name?:unknown;args?:unknown;query?:unknown};
 type RpcReply = {ok:boolean;value?:unknown;error?:{code:string;message:string}};
-type Step = {tool:string;outcome:'ok'|'error'|'pending'|'uncertain';durationMs:number;errorCode?:string;jobId?:string;outputTruncated?:boolean;attempts?:number;replayed?:boolean;role?:string;coalesced?:boolean;parked?:boolean;projectKey?:string;autoEscalated?:boolean;escalationReason?:string};
+type Step = {tool:string;outcome:'ok'|'error'|'pending'|'uncertain';durationMs:number;errorCode?:string;jobId?:string;outputTruncated?:boolean;attempts?:number;replayed?:boolean;role?:string;specialty?:string;autoSpecialist?:boolean;coalesced?:boolean;parked?:boolean;projectKey?:string;autoEscalated?:boolean;escalationReason?:string};
 type WorkerMessage =
   |{type:'rpc';id:number;request:RpcRequest}
   |{type:'done';value:unknown}
@@ -54,7 +55,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'Sandboxed JavaScript body ending with return. Large/truncated results stay in Code Mode: page semantic search or query tools.results.search/get on resultHandle. No Node, filesystem, fetch or process globals.'),
+    'QuickJS body ending with return. Use tools.agent.specialist for independent workstreams; complex/multi-domain calls auto-route. Large results stay local via result handles. No Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -121,9 +122,9 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
   {
     name:'specialist_agent',
-    description:'Run a bounded local specialist execution role (explorer/reviewer/tester/coder) over 1-16 planned BRC tool steps. This isolates permissions and trace scope; it does not spawn another LLM.',
+    description:'MANDATORY for explicit independent workstreams in complex/multi-domain work. Run a bounded local specialist role (explorer/reviewer/tester/coder) over 1-16 BRC steps, optionally labeled with a technical specialty such as go/nestjs/flutter. The agent also auto-routes eligible calls when the AI omits delegation. No second LLM is spawned.',
     inputSchema:{type:'object',required:['role','task','steps'],properties:{
-      role:{type:'string',enum:['explorer','reviewer','tester','coder']},task:{type:'string'},
+      role:{type:'string',enum:['explorer','reviewer','tester','coder']},specialty:{type:'string',maxLength:64},task:{type:'string'},
       steps:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{tool:{type:'string'},args:{type:'object'}}}},
       continue_on_error:{type:'boolean'}
     }},annotations:{readOnlyHint:false,destructiveHint:true}
@@ -313,6 +314,7 @@ export async function executeCodeMode(
         automaticRetry:false,scheduler:codeModeScheduler.status()}}};
   }
   const steps:Step[]=[];
+  const specialistPolicy=new SpecialistRoutingPolicy(input.source);
   const pendingJobs:string[]=[];
   const controller=new AbortController();
   let activeTool=false;
@@ -389,6 +391,7 @@ export async function executeCodeMode(
     workflowId,status,steps,pendingJobs,retries:trace.record.retries,
     replayedSteps:trace.record.replayedSteps,touchedPaths:[...touchedPaths],
     preflights:[...preflightResults.values()],verification:verificationSummary(),
+    specialist:specialistPolicy.summary(),
     recovery:recoveryHint,sourceObservations:sourceLedger.snapshot(),outputTruncated,
   });
   const continuationState=(finalHandle?:{id:string;label:string;bytes:number;originalBytes:number;partial:boolean;local:boolean;storageQuotaBytes:number})=>{
@@ -412,7 +415,7 @@ export async function executeCodeMode(
   };
   await checkpointRecovery('running').catch(()=>undefined);
 
-  const runToolCall=async(name:string,args:Args,role?:string):Promise<RpcReply>=>{
+  const runToolCall=async(name:string,args:Args,role?:string,specialty?:string):Promise<RpcReply>=>{
     if(!names.has(name))
       return {ok:false,error:{code:'CODE_MODE_TOOL_DENIED',message:'Tool not permitted in Code Mode. Use tools.search for available tools.'}};
     if(++calls>input.max_calls)
@@ -422,8 +425,22 @@ export async function executeCodeMode(
         message:'This Code Mode workflow already has a nested tool call in flight. Keep nested calls sequential, or fan out as separate Code Mode workflows / approved job tools.'}};
     const def=names.get(name)!;
     const readOnly=def.annotations?.readOnlyHint===true;
-    if(role&&!specialistAllows(role,name,readOnly))
-      return {ok:false,error:{code:'SPECIALIST_TOOL_DENIED',message:'Tool '+name+' is not permitted for specialist role '+role+'.'}};
+    let effectiveRole=role;
+    let effectiveSpecialty=specialty;
+    let autoSpecialist=false;
+    if(role){
+      specialistPolicy.observe(name,args);
+    }else{
+      const routed=specialistPolicy.autoRoute(name,args,readOnly,
+        candidate=>specialistAllows(candidate,name,readOnly));
+      if(routed){
+        effectiveRole=routed.role;effectiveSpecialty=routed.specialty;autoSpecialist=true;
+        await trace.event('specialist_auto_route',{tool:name,detail:{role:routed.role,
+          specialty:routed.specialty,reason:routed.reason,domains:specialistPolicy.domains()}});
+      }
+    }
+    if(effectiveRole&&!specialistAllows(effectiveRole,name,readOnly))
+      return {ok:false,error:{code:'SPECIALIST_TOOL_DENIED',message:'Tool '+name+' is not permitted for specialist role '+effectiveRole+'.'}};
     if(name==='spawn_job'||name==='run_parallel'){
       const nested=name==='spawn_job'?args.steps:args.calls;
       if(Array.isArray(nested))for(const step of nested){
@@ -444,7 +461,9 @@ export async function executeCodeMode(
       const reply=prepared.replay as RpcReply;
       const replayError=reply.ok?undefined:reply.error?.code;
       steps.push({tool:name,outcome:reply.ok?'ok':'error',durationMs:0,
-        ...(replayError?{errorCode:replayError}:{}),replayed:true,attempts:0,...(role?{role}:{})});
+        ...(replayError?{errorCode:replayError}:{}),replayed:true,attempts:0,
+        ...(effectiveRole?{role:effectiveRole}:{}),...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
+        ...(autoSpecialist?{autoSpecialist:true}:{})});
       return reply;
     }
 
@@ -485,7 +504,12 @@ export async function executeCodeMode(
       const effectiveArgs=escalation?escalation.spawnArgs:lifecycle.args;
       const rawInvoke=(signal:AbortSignal)=>parent
         ?withCallContext({...parent,id:execution.id+':'+prepared.index,signal,
-          depth:(parent.depth??0)+1},()=>executor(effectiveName,effectiveArgs))
+          depth:(parent.depth??0)+1,
+          specialist:effectiveRole?{
+            role:effectiveRole,
+            ...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
+            routing:autoSpecialist?'AUTO':'EXPLICIT',
+          }:undefined},()=>executor(effectiveName,effectiveArgs))
         :executor(effectiveName,effectiveArgs);
 
       const executeCore=async(sharedSignal:AbortSignal)=>{
@@ -566,7 +590,9 @@ export async function executeCodeMode(
         ...(response.isError?{errorCode:code}:{}),...(jobId?{jobId}:{}),
         ...(truncated?{outputTruncated:true}:{}),attempts,...(coalesced?{coalesced:true}:{}),
         ...(parked?{parked:true}:{}),...(projectKey?{projectKey}:{}),
-        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),...(role?{role}:{})});
+        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),
+        ...(effectiveRole?{role:effectiveRole}:{}),...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
+        ...(autoSpecialist?{autoSpecialist:true}:{})});
       if(pending&&jobId)pendingJobs.push(jobId);
       if(activeProjectSessionId&&projectObservations.length<64)
         projectObservations.push({tool:name,args:lifecycle.args,meta});
@@ -585,7 +611,9 @@ export async function executeCodeMode(
         durationMs:Date.now()-stepStart,errorCode:code,attempts,
         ...(coalesced?{coalesced:true}:{}),...(parked?{parked:true}:{}),
         ...(projectKey?{projectKey}:{}),
-        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),...(role?{role}:{})});
+        ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),
+        ...(effectiveRole?{role:effectiveRole}:{}),...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
+        ...(autoSpecialist?{autoSpecialist:true}:{})});
       await checkpointRecovery(uncertain?'uncertain':'failed').catch(()=>undefined);
       return reply;
     }finally{activeTool=false;}
@@ -964,7 +992,8 @@ export async function executeCodeMode(
     }
     if(request.type==='harness'&&request.name==='status')
       return {ok:true,value:{...(await harnessVNextStatus()),roundtrip:await roundTripAcceleratorStatus(),
-        livePressure:systemPressureStatus(),heavyTaskPolicy:heavyTaskPolicyStatus()}};
+        livePressure:systemPressureStatus(),heavyTaskPolicy:heavyTaskPolicyStatus(),
+        specialistPolicy:specialistPolicyStatus(),currentSpecialistRouting:specialistPolicy.summary()}};
     if(request.type==='trace'&&request.name==='current')
       return {ok:true,value:trace.snapshot()};
     if(request.type==='agent'){
@@ -973,12 +1002,14 @@ export async function executeCodeMode(
         return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.agent.run requires an argument object.'}};
       const a=request.args as Record<string,unknown>;
       const role=typeof a.role==='string'?a.role:'';
+      const specialty=typeof a.specialty==='string'?a.specialty.trim().slice(0,64):'';
       const task=typeof a.task==='string'?a.task.slice(0,1000):'';
       const childSteps=Array.isArray(a.steps)?a.steps:[];
       if(!specialistRoles().some(r=>r.role===role)||!task||childSteps.length<1||childSteps.length>16)
         return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Specialist run requires role, task and 1-16 steps.'}};
       const results:Record<string,unknown>[]=[];
-      await trace.event('specialist_start',{detail:{role,task,steps:childSteps.length}});
+      specialistPolicy.recordExplicit(role,specialty||undefined);
+      await trace.event('specialist_start',{detail:{role,specialty:specialty||undefined,task,steps:childSteps.length}});
       for(let i=0;i<childSteps.length;i++){
         const raw=childSteps[i];
         if(!raw||typeof raw!=='object'||Array.isArray(raw))
@@ -986,13 +1017,13 @@ export async function executeCodeMode(
         const step=raw as Record<string,unknown>;
         if(typeof step.tool!=='string'||!step.args||typeof step.args!=='object'||Array.isArray(step.args))
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Each specialist step requires tool and args.'}};
-        const reply=await runToolCall(step.tool,step.args as Args,role);
+        const reply=await runToolCall(step.tool,step.args as Args,role,specialty||undefined);
         results.push({index:i,tool:step.tool,ok:reply.ok,...(reply.ok?{value:reply.value}:{error:reply.error})});
         if(!reply.ok&&a.continue_on_error!==true)break;
       }
-      await trace.event('specialist_finish',{detail:{role,task,completed:results.length,
+      await trace.event('specialist_finish',{detail:{role,specialty:specialty||undefined,task,completed:results.length,
         errors:results.filter(x=>x.ok===false).length}});
-      return {ok:true,value:{role,task,results,completed:results.length,
+      return {ok:true,value:{role,...(specialty?{specialty}:{}),task,results,completed:results.length,
         allSucceeded:results.every(x=>x.ok===true),separateModel:false,
         note:'Local specialist execution context; it uses the parent-authored plan and existing BRC tools, not another LLM.'}};
     }
@@ -1186,6 +1217,7 @@ export async function executeCodeMode(
               workflowId,executionId:execution.id,traceId:trace.record.id,resumed,
               scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
               retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
+              specialistPolicy:specialistPolicy.summary(),
               modelState:modelState(status,outputTruncated),
               ...(continuation?{continuation}:{}),
               storage:{harnessStateMaxBytes:30*1024*1024,semanticCacheMaxBytes:64*1024*1024},

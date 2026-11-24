@@ -169,11 +169,15 @@ function countSummary(tool:string,result:Input,meta:Input,args:Input):string|und
 /** No source or entire arguments: target and origin are enough to trace a call. */
 export function mymcpCallPreview(_tool:string,args:unknown,_client?:{
   name?:string;version?:string
-}|null,remote=false):string{
+}|null,remote=false,specialist?:{role:string;specialty?:string;routing:'AUTO'|'EXPLICIT'}):string{
   const obj=record(args);
+  const role=specialist?.role?.replace(/[^a-zA-Z0-9_.-]/g,'').slice(0,40);
+  const specialty=specialist?.specialty?.replace(/[^a-zA-Z0-9_.-]/g,'').slice(0,40);
+  const label=role?(specialty?role+'/'+specialty:role):undefined;
   return JSON.stringify({
     ...(target(obj)?{target:target(obj)}:{}),
     origin:remote?'remote':'local',
+    ...(label?{specialist:label,routing:specialist!.routing}:{}),
   });
 }
 /** Return safe, human-sized status info only; never include the raw tool result. */

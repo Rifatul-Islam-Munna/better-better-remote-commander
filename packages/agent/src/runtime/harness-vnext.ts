@@ -11,6 +11,7 @@ import {codeModeScheduler} from './code-mode-scheduler.js';
 import {readOnlyCoalescer} from './read-only-coalescer.js';
 import {circuitBreakers} from './circuit-breakers.js';
 import {projectAffinityStatus} from './project-affinity.js';
+import {specialistPolicyStatus} from './specialist-policy.js';
 
 const VERSION=1;
 const EXECUTION_TTL=24*60*60_000;
@@ -491,7 +492,7 @@ export async function harnessVNextStatus(){
     circuitBreakers:circuitBreakers.status(),
     projectAffinity:projectAffinityStatus(),
     lifecycleHooks:['beforeToolCall','afterToolCall','onRetry','checkpoint','finish'],
-    specialistAgents:specialistRoles(),
-    note:'Specialist agents are isolated local execution roles using the calling AI-authored workflow and BRC tools; they do not spawn another LLM or require a relay change.',
+    specialistAgents:specialistRoles(),specialistPolicy:specialistPolicyStatus(),
+    note:'Specialist roles are mandatory/automatic for complex or multi-domain Code Mode work. They are isolated local execution roles using BRC tools; they do not spawn another LLM or require a relay change.',
   };
 }

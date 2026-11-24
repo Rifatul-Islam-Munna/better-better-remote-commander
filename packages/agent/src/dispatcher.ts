@@ -266,7 +266,7 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
    const action=activityAction(name,args);
   const logMode=activity.getConsoleMode();
   activity.tool('START',name,parent.id,undefined,undefined,action,undefined,
-    logMode==='mymcp'?mymcpCallPreview(name,args,parent.client,parent.remote):
+    logMode==='mymcp'?mymcpCallPreview(name,args,parent.client,parent.remote,parent.specialist):
       logMode==='verbose'?traceToolArguments(name,args):undefined);
   let out:ToolResult;
   let projectAffinity:string|undefined;

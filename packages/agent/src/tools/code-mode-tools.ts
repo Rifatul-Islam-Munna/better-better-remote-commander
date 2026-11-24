@@ -30,11 +30,11 @@ export function buildCodeModeToolDefinitions():ToolDefinition[]{
   return [{
     name:'code_mode',
     description:[
-      'USE WHEN: PRIMARY DEFAULT for multi-step coding, testing, debugging, project research and installed-plugin workflows. Multiple Code Mode workflows may run concurrently through an adaptive local scheduler. Large/truncated results are a LOCAL continuation signal, not a reason to abandon Code Mode.',
-      'USE INSTEAD: Direct read_file/edit_block/run_command only for a genuinely single simple action, or when Code Mode is unavailable/unsupported. Do NOT switch to direct fallback solely because semantic/tool output is large or truncated.',
+      'USE WHEN: PRIMARY DEFAULT for multi-step coding. Independent technical workstreams MUST use tools.agent.run/specialist with role + specialty; omitted complex or multi-domain calls are auto-routed.',
+      'USE INSTEAD: Direct tools only for one simple action or unavailable/unsupported Code Mode; large or truncated Code Mode output is NOT a fallback signal.',
       'IMPORTANT: Runs JavaScript in a bounded QuickJS/WASM sandbox ON THE PAIRED DEVICE (not the relay).',
       'The sandbox has NO Node.js process, filesystem, imports, browser, fetch or unrestricted host execution.',
-      'Use tools.search/describe/call for native and local harness capabilities. tools.parallelSafe handles stateless read-only DAGs; worker_tasks/worker_patch/worker_integrate provide the shared coding DAG across Code Mode workflows, including priority, work stealing, multi-writer worktree isolation, obsolete-branch cancellation and incremental/final verification.',
+      'Use tools.search/describe/call for local capabilities. tools.agent.specialist({role,specialty,task,steps}) is the explicit specialist API; tools.agent.roles() lists permissions. tools.parallelSafe handles safe read DAGs; worker_tasks coordinates shared coding DAGs.',
       'Concurrency is hardware-aware: hard ceiling 12 admitted / 8 runnable, continuously scaled by live CPU/RAM/event-loop pressure with per-project fairness. Safe reads coalesce, waits park/wake, transient infrastructure uses circuit breakers, and definite build/test/install/check work auto-escalates to durable jobs. Harness state shares 30 MiB; semantic cache has 64 MiB.',
       'Provide JavaScript statements in source and finish with return. Example:',
       'const a=await tools.call("git_status",{path:"D:/repo"});',

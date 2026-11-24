@@ -64,7 +64,7 @@ test('untrusted inline scripts are not logged as raw source',()=>{
   assert.doesNotMatch(masked,/abc-123|hidden|u:p@/);
 });
 
-test('verbose output wraps without 160-character truncation while bounded by 500 KiB', async()=>{
+test('verbose output wraps without 160-character truncation while bounded by 1 MiB', async()=>{
   const log=new ActivityLog(undefined,true);
   const text='a'.repeat(950);
   log.tool('OK','start_process','id1',200,undefined,'build',undefined,'Output preview:\n'+text);
@@ -73,14 +73,14 @@ test('verbose output wraps without 160-character truncation while bounded by 500
   assert.ok(display.includes('aaaaaa'));
   assert.ok(display.replace(/\n/g,'').includes('a'.repeat(950)));
   assert.ok(display.split('\n').length>12,display);
-  assert.equal(MAX_ACTIVITY_LOG_BYTES,500*1024);
-  assert.equal(MAX_ACTIVITY_EVENT_BYTES+40*1024+32*1024,500*1024);
-  for(let i=0;i<800;i++)log.tool('OK','run_command','id'+i,1,
+  assert.equal(MAX_ACTIVITY_LOG_BYTES,1024*1024);
+  assert.equal(MAX_ACTIVITY_EVENT_BYTES+40*1024+32*1024,MAX_ACTIVITY_LOG_BYTES);
+  for(let i=0;i<1600;i++)log.tool('OK','run_command','id'+i,1,
     undefined,'pnpm build',undefined,'Output preview:\n'+text);
   const all=log.recent();
-  assert.ok(all.length<800,'oldest events were evicted');
+  assert.ok(all.length<1600,'oldest events were evicted');
   assert.ok(all.reduce((n,e)=>n+Buffer.byteLength(JSON.stringify(e),'utf8'),0)<=MAX_ACTIVITY_EVENT_BYTES);
-  assert.equal(all.at(-1).id,'id799');
+  assert.equal(all.at(-1).id,'id1599');
   await log.close();
 });
 

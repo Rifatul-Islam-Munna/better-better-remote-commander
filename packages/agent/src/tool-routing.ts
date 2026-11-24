@@ -17,9 +17,9 @@ export interface ToolChoice {
 /** Keep each tool's recommendation concise; detailed parameters live in JSON Schema. */
 export const TOOL_CHOICES: Record<string, ToolChoice> = {
   code_mode: {
-    use: 'PRIMARY DEFAULT for multi-step work: keep reads, searches, edits, tests, project sessions, large-result filtering, reusable sessions and durable jobs local so the calling AI usually needs one remote MCP call.',
-    instead: 'Use direct read/edit/command tools only for one genuinely simple action or when Code Mode is unavailable/unsupported; large or truncated Code Mode output is NOT a fallback signal.',
-    caveat: 'When continuation/resultHandle is returned, stay in Code Mode and page/filter locally with tools.results.search/get or smaller semantic pages. Durable replay never blindly replays uncertain mutations.',
+    use: 'PRIMARY DEFAULT for multi-step work. Independent workstreams MUST use tools.agent.run/specialist; otherwise complex/multi-domain calls auto-route.',
+    instead: 'Use direct tools only for one simple action or unavailable/unsupported Code Mode; large or truncated Code Mode output is NOT a fallback signal.',
+    caveat: 'Specialists are local permission scopes, not extra LLMs. Stay in Code Mode for continuations; never replay uncertain mutations.',
   },
   get_config: {
     use: 'Inspect this BRC agent configuration and access limits.',

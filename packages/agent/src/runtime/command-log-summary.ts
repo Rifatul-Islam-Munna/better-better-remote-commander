@@ -13,6 +13,7 @@ export function summarizeCommandActivity(result: unknown): CommandActivityResult
     ? meta.exitCode : null;
   if (meta.cancelled === true) return {exitCode, detail:'cancelled by request'};
   if (meta.timedOut === true) return {exitCode, detail:'hard runtime limit reached'};
+  if (meta.noMatches === true) return {exitCode,detail:'no matches (exit 1)'};
   if (!r.isError) return {exitCode, detail:exitCode === null ? 'finished' : 'exit '+exitCode};
   const content = Array.isArray(r.content) ? r.content : [];
   const text = content.filter(c => c && typeof c === 'object' &&

@@ -27,7 +27,10 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
   const {buildCodeModeToolDefinitions}=await import('../dist/tools/code-mode-tools.js');
   const {handleRunParallel,setJobToolExecutor}=await import('../dist/tools/jobs.js');
+  const {rgPath}=await import('@vscode/ripgrep');
   const {handleStartSearch}=await import('../dist/core/handlers/search-handlers.js');
+  const {handleReadFile}=await import('../dist/core/handlers/filesystem-handlers.js');
+  const {EXPERT_TOOL_HANDLERS}=await import('../dist/tools/expert-tools.js');
   const {CODING_TOOL_HANDLERS}=await import('../dist/tools/coding-tools.js');
   ({searchManager}=await import('../dist/core/search-manager.js'));
   ({configManager}=await import('../dist/core/config-manager.js'));
@@ -41,7 +44,9 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    {name:'read_file',description:'Synthetic barrier read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'read_code_file',description:'Real source read behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'start_search',description:'Real blocking search behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+   {name:'project_map',description:'Real bounded project map behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_parallel',description:'Bounded parallel DAG',inputSchema:{type:'object'}},
+   {name:'run_command',description:'Explicit native command using normal job policies',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
    {name:'agent_status',description:'Live test status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'cancel_operation',description:'Cancel test operation',inputSchema:{type:'object'}}];
   let active=0,peak=0,target=4,arrived=0,finished=new Set();
@@ -51,7 +56,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   reset(4);
   const executor=async(name,a)=>{
    if(name==='run_parallel')return handleRunParallel(a);
-   assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file');
+   assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file'||name==='project_map');
    const signal=getCallContext()?.signal;
    if(a.depends)assert.ok(finished.has(a.depends),'dependent read started before its predecessor settled');
    active++;peak=Math.max(peak,active);arrived++;
@@ -70,6 +75,8 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
      return result;
     }
     if(name==='read_code_file')return CODING_TOOL_HANDLERS.read_code_file(a);
+    if(name==='project_map')return EXPERT_TOOL_HANDLERS.project_map(a);
+    if(name==='read_file'&&a.path)return handleReadFile(a);
     if(a.fail)return {isError:true,content:[{type:'text',text:'READ_FAILED'}],structuredContent:{error:{code:'READ_FAILED'}}};
     finished.add(a.token);
     return {content:[{type:'text',text:'read '+a.token}]};
@@ -123,6 +130,24 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.ok(codeModeScheduler.status().maxObservedActive>=4);
    assert.equal(new Set(results.map(r=>r.structuredContent.workflowId)).size,4);
   });
+  await t.test('editing help, aliases, unknown topics and tool-name help do not reject ordinary discovery',async()=>{
+   const result=await tool('code_mode',{source:'const a=await tools.help("editing");const b=await tools.help("parallel");const c=await tools.help("future-topic");const d=await tools.help("run_command");return {editTools:a.tools,commands:b.commands,fallback:c.topicFound,topics:c.topics,tool:d.name};'});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   const value=result.structuredContent.result;
+   assert.ok(value.editTools.includes('edit_files'));assert.match(value.commands,/run_command/);
+   assert.equal(value.fallback,false);assert.ok(value.topics.includes('editing'));assert.equal(value.tool,'run_command');
+  });
+  await t.test('logged parallel run_command pattern accepts native rg and treats no matches as a completed search',async()=>{
+   const calls=['alphaNeedle','betaNeedle','missing_parallel_fixture_123'].map(pattern=>({tool:'run_command',args:{program:rgPath,args:['-n',pattern,'.'],cwd:project,maxOutputChars:22000}}));
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+',{max_concurrency:3});return {routing:r.parallelRouting,calls:r.commandCalls,results:r.map(v=>({isError:v.isError,exit:v.structuredContent.exitCode,noMatches:v.structuredContent.noMatches,text:v.text}))};'});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   const value=result.structuredContent.result;
+   assert.equal(value.routing,'run_parallel');assert.equal(value.calls,3);
+   assert.deepEqual(value.results.map(v=>v.exit),[0,0,1]);
+   assert.ok(value.results.every(v=>!v.isError));assert.equal(value.results[2].noMatches,true);
+   assert.match(value.results[2].text,/No matches/);
+  });
   await t.test('parallelSafe executes concurrent reads and honors DAG dependencies',async()=>{
    reset(2);
    const result=await tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"read_file",args:{token:"a"}},{tool:"read_file",args:{token:"b"}},{tool:"read_file",args:{token:"c",depends:"a"},depends_on:[0,1]}]); return r.structuredContent;'});
@@ -153,6 +178,28 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
     assert.doesNotMatch(text,new RegExp(args.pattern==='alphaNeedle'?'betaNeedle':'alphaNeedle'));
    }
    await until(()=>searchManager.getActiveSessionCount()===0);
+  });
+  await t.test('latest logged search plus project map script succeeds through MCP',async()=>{
+   reset(2);
+   const source='const root='+JSON.stringify(project)+';const r=await tools.parallelSafe([{tool:"project_map",args:{path:root,limit:250}},{tool:"start_search",args:{path:root,pattern:"alphaNeedle|betaNeedle",searchType:"content",filePattern:"*.{ts,kt,java,dart,xml}",wait:true,maxResults:90,contextLines:0}}],{max_concurrency:2});return {total:r.structuredContent.total,search:r.results[1]};';
+   const result=await tool('code_mode',{source});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   assert.equal(result.structuredContent.result.total,2);assert.equal(peak,2);
+   assert.equal(result.structuredContent.result.search.structuredContent.totalMatches,2);
+  });
+  await t.test('latest logged three native read_file calls support map and overlap through MCP',async()=>{
+   reset(3);
+   const files=['receiver.kt','transport.kt','adaptive.dart'];
+   const prefixes=['camera','transport','adaptive'];
+   for(const [i,file]of files.entries())await fs.writeFile(path.join(project,file),Array.from({length:321},(_,line)=>prefixes[i]+'-line-'+line).join('\n'));
+   const calls=files.map((file,i)=>({tool:'read_file',args:{path:path.join(project,file),offset:i===0?100:0,length:[210,130,220][i],...(i===0?{maxChars:16000}:{})}}));
+   const result=await tool('code_mode',{source:'const a=await tools.parallelSafe('+JSON.stringify(calls)+',{max_concurrency:3});return a.map(x=>x.text);'});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   assert.equal(peak,3);
+   assert.equal(result.structuredContent.result.length,3);
+   for(const [i,text]of result.structuredContent.result.entries())assert.ok(text.includes(prefixes[i]+'-line-'+(i===0?100:0)),text);
   });
   await t.test('parallelSafe exposes ordered native replies and supports the logged map pattern',async()=>{
    reset(2);

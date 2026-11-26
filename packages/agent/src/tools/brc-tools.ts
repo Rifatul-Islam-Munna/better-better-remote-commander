@@ -328,9 +328,14 @@ export async function runCommandCore(
     if (opts.signal?.aborted) onAbort();
   });
 
-  const format = (r: Outcome, note?: string): ServerResult => {
+  const format = (r: Outcome, note?: string,searchExitEligible=true): ServerResult => {
     const {exitCode,signal,cancelled,timedOut,terminationUnconfirmed} = r;
-    const failed = !!terminationUnconfirmed || cancelled || timedOut || exitCode !== 0;
+    const executableName=path.basename(directProgram??(fast?.kind==='native'?fast.executable:'')).replace(/\.exe$/i,'').toLowerCase();
+    // ripgrep documents exit 1 as no matches, not a failed search. Only
+    // normalize a proven direct executable, never an arbitrary shell chain.
+    const noMatches=searchExitEligible&&(executableName==='rg'||executableName==='ripgrep')&&exitCode===1&&
+      !signal&&!terminationUnconfirmed&&!cancelled&&!timedOut&&!r.err.trim();
+    const failed = !!terminationUnconfirmed || cancelled || timedOut || exitCode !== 0&&!noMatches;
     const status = terminationUnconfirmed ? 'TERMINATION_UNCONFIRMED'
       : cancelled ? 'CANCELLED'
       : timedOut ? 'TIMEOUT after '+timeoutMs+'ms'
@@ -340,11 +345,13 @@ export async function runCommandCore(
       ' | cwd '+actualCwd+']\n'+
       (shellDecision.reason?'[shell selection] '+shellDecision.reason+'\n':'')+
       (note?'[output processing] '+note+'\n':'')+
+      (noMatches?'[search] No matches found (ripgrep exit 1; search completed successfully).\n':'')+
       (parsed.data.maxOutputChars>maxOutputChars
         ? '[output budget] requested '+parsed.data.maxOutputChars+
           ' chars; limited to '+maxOutputChars+' to protect the MCP response.\n':'')+
       (r.truncated?'[OUTPUT TRUNCATED: command completed or stopped, but some logs were omitted. Request narrower diagnostic output; do not treat this as the full log.]\n':'');
-    let cause='',suggestion='',commandFailureKind='NONZERO_EXIT';
+    let cause='',suggestion='',commandFailureKind='NONZERO_EXIT',commandErrorCode='COMMAND_FAILED';
+    let httpStatus:number|undefined;
     if(terminationUnconfirmed){
       cause='A stop was requested, but root-process exit was not observed before the grace deadline. Side effects may still occur.';
       suggestion='Inspect running processes and actual filesystem/external state; do not automatically repeat this command.';
@@ -357,7 +364,13 @@ export async function runCommandCore(
         opts.maxTimeoutMs+'ms. For interactive/longer work use start_process, then read_process_output. Verify side effects before retrying.';
     } else if(failed) {
       const combined=r.err+'\n'+r.out;
-      if(/not a git repository/i.test(combined)) {
+      const http=/^(?:powershell|pwsh)$/.test(executableName)
+        ?/(?:remote server returned an error:\s*\(|response status code does not indicate success:\s*|HTTP\/\d(?:\.\d)?\s+)([45]\d{2})\b/i.exec(r.err):null;
+      if(http){
+        httpStatus=Number(http[1]);commandErrorCode='HTTP_REQUEST_FAILED';commandFailureKind='HTTP_STATUS';
+        cause='The remote HTTP endpoint returned status '+httpStatus+'.';
+        suggestion='Inspect stderr and verify the endpoint/ref for 404, or authentication/rate limits for 401/403/429. The request failed; do not replay the unchanged command automatically.';
+      } else if(/not a git repository/i.test(combined)) {
         commandFailureKind='GIT_NOT_REPOSITORY';
         cause='Git was executed outside a repository.';
         suggestion='Set cwd to the absolute Git repository directory, then re-run only the corrected command. Or use git_status / git_log for separate diagnostics.';
@@ -394,15 +407,16 @@ export async function runCommandCore(
       (r.out?'\n--- stdout ---\n'+r.out.trimEnd()+'\n':'\n(no stdout)\n')+
       (r.err?'\n--- stderr ---\n'+r.err.trimEnd()+'\n':'')+
       (failed?'\nDIAGNOSIS: '+cause+'\nNEXT ACTION: '+suggestion+'\n':'');
-    const code=terminationUnconfirmed?'TOOL_OUTCOME_UNCERTAIN':cancelled?'CANCELLED':timedOut?'TIMEOUT':'COMMAND_FAILED';
+    const code=terminationUnconfirmed?'TOOL_OUTCOME_UNCERTAIN':cancelled?'CANCELLED':timedOut?'TIMEOUT':commandErrorCode;
     return {
       ...text(body,failed),
       structuredContent:{
         exitCode,signal,durationMs:r.ms,timedOut,cancelled,commandExecuted:true,
         executionCompleted:!terminationUnconfirmed&&!cancelled&&!timedOut,
-        commandSucceeded:exitCode===0&&!terminationUnconfirmed&&!cancelled&&!timedOut,
+        commandSucceeded:(exitCode===0||noMatches)&&!terminationUnconfirmed&&!cancelled&&!timedOut,
         toolInfrastructureSucceeded:!terminationUnconfirmed,
-        processOutcome:terminationUnconfirmed?'uncertain':cancelled?'cancelled':timedOut?'timed_out':exitCode===0?'success':'nonzero_exit',
+        processOutcome:terminationUnconfirmed?'uncertain':cancelled?'cancelled':timedOut?'timed_out':noMatches?'no_matches':exitCode===0?'success':'nonzero_exit',
+        ...(noMatches?{noMatches:true}:{}),...(httpStatus?{httpStatus}:{}),
         terminationState:managedTerminationState(cancelled||timedOut,!terminationUnconfirmed),
         environmentPolicy:commandEnvironmentPolicy(),
         platform:process.platform,shell:shellPath,configuredShell,
@@ -437,7 +451,7 @@ export async function runCommandCore(
     const r = await execOnce({ executable: rtkPath, args: rtkArgs }, rtkEnv(env));
     if (!r.spawnError && !(r.exitCode !== null && isRtkUsageError(r.exitCode, r.err))) {
       const a = annotateRtkOutput(r.out, r.err);
-      return format({ ...r, out: a.stdout, err: a.stderr }, a.note);
+      return format({ ...r, out: a.stdout, err: a.stderr }, a.note,false);
     }
     if (opts.signal?.aborted) return format(r);
   }
@@ -661,7 +675,8 @@ export function buildBrcToolDefinitions(): ToolDefinition[] {
         'On Windows, default shell is Windows PowerShell 5.1 (powershell.exe) unless changed in config. PowerShell 5.1 does NOT support && or ||.',
         'For safe native CLI chains such as git status -s && git log -n 10 --oneline, run_command automatically selects cmd.exe when no shell is explicitly requested.',
         'For deliberate CMD syntax set shell:"cmd.exe"; for PowerShell-specific statements use PowerShell 5.1 syntax without &&/||, or pwsh.exe 7+ if installed.',
-        'SHELL_SYNTAX means no command executed. COMMAND_FAILED means actual non-zero shell exit. TIMEOUT means command exceeded budget. Inspect structuredContent.error and recovery.',
+        'SHELL_SYNTAX means no command executed. Native rg exit 1 without stderr is a successful no-match search: noMatches=true, original exitCode=1 preserved. Other non-zero exits remain errors.',
+        'Native PowerShell HTTP failures expose HTTP_REQUEST_FAILED with httpStatus. TIMEOUT means command exceeded budget. Inspect structuredContent.error and recovery.',
         'Use raw:true to disable rtk compression during diagnosis (still bounded output). Do not blindly retry the identical command or an uncertain mutation.',
         'Blocked commands (config blockedCommands) are rejected.',
         'Output of common dev commands (git status/log/diff, cargo/go/pytest/vitest/jest/tsc/eslint, npm run, ...)',

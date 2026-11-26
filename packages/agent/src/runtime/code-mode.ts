@@ -42,7 +42,7 @@ import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} fro
 import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText,compactStructured} from './adaptive-result-budget.js';
 import {getVerificationEvidence,isTrackedMutation,isVerificationOperation} from './verification-evidence.js';
 import {SpecialistRoutingPolicy,specialistPolicyStatus} from './specialist-policy.js';
-import {codeModeHelp,CODE_MODE_HELP_TOPICS} from './code-mode-help.js';
+import {codeModeHelp} from './code-mode-help.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
@@ -56,7 +56,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'QuickJS body ending with return. Start with await tools.help(); default to tools.parallelSafe for independent safe reads/blocking searches, or concurrent outer code_mode calls when the host supports them. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
+    'QuickJS body ending with return. Start with await tools.help(); default to tools.parallelSafe for independent reads/searches and explicit run_command calls, or concurrent outer code_mode calls when the host supports them. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -84,12 +84,12 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   {
     name:'code_mode_help',
     description:'Code Mode onboarding: parallelism examples, full feature/API map and error recovery. Prefer await tools.help(topic); no tool execution or state writes.',
-    inputSchema:{type:'object',properties:{topic:{type:'string',enum:[...CODE_MODE_HELP_TOPICS]}}},
+    inputSchema:{type:'object',properties:{topic:{type:'string',maxLength:160,description:'Help topic, alias or available tool name. Unknown topics return the overview and supported topics.'}}},
     annotations:{readOnlyHint:true}
   },
   {
     name:'parallel_safe',
-    description:'Default for independent agent-verified reads and blocking start_search calls inside Code Mode. Omitted search wait defaults to true; explicit wait:false, mutations and cursor/job-control tools are rejected before execution. Fanout adapts to live machine pressure.',
+    description:'Run independent verified reads, blocking start_search calls and explicit run_command calls through the normal bounded job scheduler. Commands retain command/path policy and CPU limits and may mutate; do not overlap competing writes. Omitted search wait defaults to true. Cursor/job-control tools and direct file mutations remain separate.',
     inputSchema:{type:'object',required:['calls'],properties:{
       calls:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{
         tool:{type:'string'},args:{type:'object'},depends_on:{type:'array',items:{type:'integer',minimum:0}}
@@ -97,7 +97,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
       max_concurrency:{type:'integer',minimum:1,maximum:3},
       timeout_ms:{type:'integer',minimum:1000,maximum:100000},
       output_chars:{type:'integer',minimum:200,maximum:16000}
-    }},annotations:{readOnlyHint:true}
+    }},annotations:{readOnlyHint:false,destructiveHint:true}
   },
   {
     name:'semantic_project_search',
@@ -593,7 +593,7 @@ export async function executeCodeMode(
           verificationResults.set(projectKey,await getVerificationEvidence(projectKey));
       }
       const pending=meta.pending===true;
-      const error=meta.error as {code?:unknown}|undefined;
+      const error=meta.error as {code?:unknown;message?:unknown}|undefined;
       const nestedFailed=name==='run_parallel'&&typeof meta.failed==='number'&&meta.failed>0;
       const code=typeof error?.code==='string'?error.code:nestedFailed?'PARALLEL_CALL_FAILED':'TOOL_FAILED';
       const jobId=typeof meta.jobId==='string'?meta.jobId:undefined;
@@ -610,8 +610,12 @@ export async function executeCodeMode(
       if(truncated&&!handle)truncatedWithoutHandle++;
       if(projectKey&&verificationResults.has(projectKey))value.verificationEvidence=verificationResults.get(projectKey);
       if(recoveryHint&&!recoveryDelivered){value.recoveryCapsule=recoveryHint;recoveryDelivered=true;}
+      // A long PowerShell argv header must not displace the HTTP status from
+      // the bounded guest error. Use the short, classified native diagnosis.
+      const errorText=code==='HTTP_REQUEST_FAILED'&&typeof error?.message==='string'
+        ?error.message:typeof value.text==='string'?value.text:'Tool failed.';
       const reply:HarnessReply=response.isError
-        ?{ok:false,error:{code,message:(typeof value.text==='string'?value.text:'Tool failed.').slice(0,700)}}
+        ?{ok:false,error:{code,message:errorText.slice(0,700)}}
         :{ok:true,value};
       await durableSettleStep(execution,prepared.index,reply,attempts,trace);
       steps.push({tool:name,outcome:status,durationMs:Date.now()-stepStart,
@@ -687,9 +691,9 @@ export async function executeCodeMode(
         const item=raw as Record<string,unknown>;
         const tool=typeof item.tool==='string'?item.tool:'';
         const def=names.get(tool);
-        if(!def||def.annotations?.readOnlyHint!==true||PARALLEL_SAFE_STATEFUL_DENY.has(tool))
+        if(!def||(def.annotations?.readOnlyHint!==true&&tool!=='run_command')||PARALLEL_SAFE_STATEFUL_DENY.has(tool))
           return {ok:false,error:{code:'PARALLEL_SAFE_TOOL_DENIED',
-            message:'parallelSafe only accepts independent agent-verified read-only tools; '+(tool||'call #'+(i+1))+' is not eligible. Keep stateful calls sequential or submit independent outer code_mode workflows concurrently. No calls were started. See tools.help("parallelism").'}};
+            message:'parallelSafe accepts independent verified reads and explicit run_command calls; '+(tool||'call #'+(i+1))+' is not eligible. Keep stateful calls and direct file mutations separate, or use independent outer code_mode workflows. No calls were started. See tools.help("parallelism").'}};
         if(!item.args||typeof item.args!=='object'||Array.isArray(item.args))
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'parallelSafe call #'+(i+1)+' requires args object.'}};
         const args=item.args as Args;
@@ -709,12 +713,13 @@ export async function executeCodeMode(
       calls+=safeCalls.length-1; // runToolCall below accounts for the wrapper call.
       for(const call of safeCalls)if(call.args&&typeof call.args==='object'&&!Array.isArray(call.args))
         rememberPaths(call.args as Args);
+      const commandCalls=safeCalls.filter(call=>call.tool==='run_command').length;
       const firstArgs=safeCalls[0]?.args;
       if(firstArgs&&typeof firstArgs==='object'&&!Array.isArray(firstArgs)){
         const projectKey=await inferProjectAffinity(firstArgs as Record<string,unknown>).catch(()=>undefined);
         if(projectKey){
           await schedulerLease.setProject(projectKey,controller.signal);
-          await ensurePreflight(projectKey,'read','parallel_safe');
+          await ensurePreflight(projectKey,commandCalls?'mutation':'read','parallel_safe');
         }
       }
       const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):3;
@@ -757,12 +762,13 @@ export async function executeCodeMode(
           ...(typeof ids[index]==='string'?{jobId:ids[index],next:{tool:'get_job',args:{id:ids[index]}}}:{}),
         }));
         // Do not mutate the reply referenced by the durable step ledger.
-        parallelReply={...reply,value:{...value,results:projectedResults}};
+        parallelReply={...reply,value:{...value,results:projectedResults,
+          ...(commandCalls?{parallelRouting:'run_parallel',commandCalls}:{})}};
       }
-      if(reply.ok)for(const call of safeCalls)
+      if(reply.ok)for(const call of safeCalls)if(call.tool!=='run_command')
         await sourceLedger.recordRead(String(call.tool),call.args as Record<string,unknown>).catch(()=>undefined);
       await trace.event('parallel_safe',{detail:{calls:safeCalls.length,maxConcurrency,
-        workloadClasses:adaptive.classes,pressure:adaptive.pressure,ok:reply.ok}});
+        workloadClasses:adaptive.classes,pressure:adaptive.pressure,commandCalls,ok:reply.ok}});
       return parallelReply;
     }
     if(request.type==='semantic'){
@@ -1062,8 +1068,10 @@ export async function executeCodeMode(
     if(request.type==='harness'&&request.name==='help'){
       const a=request.args&&typeof request.args==='object'&&!Array.isArray(request.args)?request.args as Args:{};
       const topic=a.topic??'overview';
-      if(typeof topic!=='string'||!CODE_MODE_HELP_TOPICS.some(t=>t===topic))
-        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Code Mode help topics: '+CODE_MODE_HELP_TOPICS.join(', ')}};
+      if(typeof topic!=='string'||topic.length>160)
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Code Mode help topic must be a string of at most 160 characters.'}};
+      const tool=discoverableNames.get(topic.trim());
+      if(tool)return {ok:true,value:describe(tool)};
       return {ok:true,value:codeModeHelp(topic)};
     }
     if(request.type==='harness'&&request.name==='status')

@@ -17,7 +17,7 @@ let scheduled=false;
 
 const explanations:Record<string,string>={
   CODE_MODE_SCRIPT_FAILED:'guest JavaScript failed; inspect the returned script error and tools.help("errors"); verify exact tool schemas and response.structuredContent fields',
-  PARALLEL_SAFE_TOOL_DENIED:'parallelSafe rejected an ineligible call; use blocking start_search with wait:true, keep cursors sequential, or use independent outer code_mode workflows',
+  PARALLEL_SAFE_TOOL_DENIED:'parallelSafe rejected an ineligible call; verified reads, blocking start_search and explicit run_command are supported; keep cursors/direct file mutations separate',
   CODE_MODE_TOOL_DENIED:'tool is not available in Code Mode; discover the permitted tool schema first',
   CODE_MODE_CALL_LIMIT:'workflow exceeded its nested tool-call budget; split the work or request a supported max_calls limit',
   CODE_MODE_NESTED_PARALLEL_DENIED:'ordinary nested calls overlap; use tools.parallelSafe for eligible reads, run_parallel for commands or concurrent outer code_mode workflows',
@@ -61,6 +61,7 @@ const explanations:Record<string,string>={
   PROCESS_NOT_ACTIVE:'no active process has this PID; inspect list_sessions or get_job',
   PROCESS_INPUT_REJECTED:'stdin is unavailable or the process has exited; inspect the process before retrying',
   COMMAND_FAILED:'command returned a real nonzero exit; inspect stderr and exitCode, correct the command before retrying',
+  HTTP_REQUEST_FAILED:'remote HTTP request failed; inspect httpStatus/stderr and verify endpoint, authentication or rate limits before retrying',
   SHELL_SYNTAX:'PowerShell or cmd syntax rejected before execution; use program+args or select the proper shell',
   CODE_SNAPSHOT_NOT_FILE:'read_code_file expects a file; inspect the parent using list_directory',
   CODE_SNAPSHOT_FAILED:'source snapshot could not be read; inspect file type and permissions with get_file_info',

@@ -57,7 +57,8 @@ export const KillProcessArgsSchema = z.object({
 
 // Filesystem tools schemas
 export const ReadFileArgsSchema = z.object({
-  path: z.string(),
+  path: z.string().min(1),
+  maxChars:z.number().int().min(1000).max(128000).optional().describe('Model-facing text budget, default 12000 characters. Follow read.next for contiguous pages; opt in to larger context only when needed.'),
   isUrl: z.boolean().optional().default(false),
   offset: z.number().int().optional().default(0),
   length: z.number().int().min(1).max(2000).optional(),
@@ -78,6 +79,7 @@ export const ReadMultipleFilesEntrySchema = z.object({
 });
 
 export const ReadMultipleFilesArgsSchema = z.object({
+  maxChars:z.number().int().min(1000).max(160000).optional().describe('Combined text budget, default 32000 characters. Per-file pages stay compact; follow batch.continuations for omitted source.'),
   paths: z.array(z.string().min(1)).max(64).optional().default([]),
   files: z.array(ReadMultipleFilesEntrySchema).max(64).optional().default([]),
 }).refine(

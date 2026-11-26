@@ -19,8 +19,9 @@ import { activity, RETENTION_MS } from '../runtime/activity.js';
 import { toolHistory } from '../core/utils/toolHistory.js';
 import { operationStatus, cancelOperation } from '../runtime/operations.js';
 import { checkCancelled, getCallContext, withCallContext } from '../context.js';
+import {DEFAULT_READ_CHARS} from '../runtime/read-budget.js';
 
-const SnapshotSchema = z.object({ path:z.string().min(1), offset:z.number().int().min(0).default(0), length:z.number().int().min(1).max(2000).default(200), charOffset:z.number().int().min(0).optional(), charLength:z.number().int().min(1).max(100000).default(50000) });
+const SnapshotSchema = z.object({ path:z.string().min(1), offset:z.number().int().min(0).default(0), length:z.number().int().min(1).max(2000).default(200), charOffset:z.number().int().min(0).optional(), charLength:z.number().int().min(1).max(100000).default(DEFAULT_READ_CHARS), maxChars:z.number().int().min(1000).max(100000).optional().describe('Text budget for source line reads, default 12000. Larger reads require an explicit budget; follow next for contiguous source.') });
 const ContextSchema = z.object({ path:z.string().min(1), pattern:z.string().min(1), literalSearch:z.boolean().default(true), filePattern:z.string().optional(), maxResults:z.number().int().min(1).max(50).default(10), contextLines:z.number().int().min(0).max(30).default(5) });
 const EditSchema = z.object({ old_string:z.string().min(1), new_string:z.string(), expected_replacements:z.number().int().min(1).max(10000).default(1) });
 const EditFilesSchema = z.object({ files:z.array(z.object({ path:z.string().min(1), expected_sha256:z.string().regex(/^[a-fA-F0-9]{64}$/), edits:z.array(EditSchema).min(1).max(100) })).min(1).max(16), dryRun:z.boolean().default(false) });
@@ -66,30 +67,33 @@ import {verificationEvidenceStatus} from '../runtime/verification-evidence.js';
 import {mutationChainStatus} from '../runtime/mutation-chain.js';
 
 
-export async function snapshot(file:string, offset=0, length=200, charOffset?:number, charLength=50000) {
+export async function snapshot(file:string, offset=0, length=200, charOffset?:number, charLength=DEFAULT_READ_CHARS, maxChars?:number) {
   file=await validatePath(file);
   const bytes=await readBounded(file,8*1024*1024), content=decodeCode(bytes), lines=content.split('\n');
   if(charOffset!==undefined) {
-    const text=content.slice(charOffset,charOffset+charLength);
+    const text=content.slice(charOffset,charOffset+Math.min(charLength,maxChars??charLength));
     const hasMore=charOffset+text.length<content.length;
     return {path:file,sha256:sha256(bytes),sizeBytes:bytes.length,mode:'characters',
       charOffset,charLength:text.length,totalChars:content.length,text,truncated:hasMore,
       nextCharOffset:hasMore?charOffset+text.length:null,
-      next:{tool:'read_code_file',args:hasMore?{path:file,charOffset:charOffset+text.length,charLength}:null},
+      next:hasMore?{tool:'read_code_file',args:{path:file,charOffset:charOffset+text.length,charLength,...(maxChars?{maxChars}:{})}}:null,
       note:hasMore?'Request nextCharOffset to continue, do not treat partial source as complete.':'Character range complete.'};
   }
-  const selected=lines.slice(offset,offset+length).join('\n'),text=selected.slice(0,100000);
+  const selected=lines.slice(offset,offset+length).join('\n'),text=selected.slice(0,maxChars??DEFAULT_READ_CHARS);
   const oversized=selected.length>text.length, hasMore=oversized||offset+length<lines.length;
+  let startChar=0;
+  for(let i=0;i<Math.min(offset,lines.length);i++)startChar+=lines[i].length+1;
   return {path:file,sha256:sha256(bytes),sizeBytes:bytes.length,offset,
-    length:Math.min(length,Math.max(0,lines.length-offset)),totalLines:lines.length,text,
+    length:Math.min(length,Math.max(0,lines.length-offset)),totalLines:lines.length,text,startCharOffset:startChar,totalChars:content.length,
     truncated:hasMore,moreLines:offset+length<lines.length,
-    next:oversized?{tool:'read_code_file',args:{path:file,charOffset:0,charLength:50000},
-      note:'This line range exceeded the character budget. Use charOffset/charLength and nextCharOffset to retrieve it completely.'}:
-      hasMore?{tool:'read_code_file',args:{path:file,offset:offset+length,length}}:null};
+    ...(oversized?{nextCharOffset:startChar+text.length,characterTruncated:true}:{}),
+    next:oversized?{tool:'read_code_file',args:{path:file,charOffset:startChar+text.length,charLength:maxChars??DEFAULT_READ_CHARS},
+      note:'Continue immediately after the returned contiguous prefix; do not restart at character zero.'}:
+      hasMore?{tool:'read_code_file',args:{path:file,offset:offset+length,length,...(maxChars?{maxChars}:{})}}:null};
 }
 async function readCodeFile(raw:unknown):Promise<ToolResult> {
  const a=SnapshotSchema.parse(raw);
- try{return result(await snapshot(a.path,a.offset,a.length,a.charOffset,a.charLength));}
+ try{return result(await snapshot(a.path,a.offset,a.length,a.charOffset,a.charLength,a.maxChars));}
  catch(e){
   const code=errorCode(e);
   if(code==='ENOENT')return missingFileResponse(a.path);
@@ -146,6 +150,23 @@ async function readCodeContext(raw:unknown):Promise<ToolResult> {
   } finally { searchManager.releaseSearch(started.sessionId); }
 }
 
+function editMismatch(code:string,message:string,file:string,hash:string,content:string,wanted:string,fileIndex:number,editIndex:number,actual:number){
+  const probe=wanted.split(/\r?\n/).find(line=>line.trim().length>=6)?.slice(0,96);
+  const candidateLines:number[]=[];
+  if(probe)for(let at=content.indexOf(probe);at>=0&&candidateLines.length<5;at=content.indexOf(probe,at+probe.length)){
+    let line=1;for(let n=content.indexOf('\n');n>=0&&n<at;n=content.indexOf('\n',n+1))line++;
+    candidateLines.push(line);
+  }
+  const next={tool:'read_code_file',args:{path:file,offset:Math.max(0,(candidateLines[0]??1)-4),length:30,maxChars:6000}};
+  const out=failure(new AgentError(code,message));
+  out.structuredContent={...out.structuredContent,changed:false,currentSha256:hash,
+    failedFileIndex:fileIndex,failedEditIndex:editIndex,actualReplacements:actual,candidateLines,next,
+    recovery:{automaticRetry:false,retryUnchanged:false,next,
+      suggestion:'No files were written. Read the exact current source window/hash, then correct a unique anchor. Candidate lines are hints, not permission to apply approximate edits.'}};
+  out.content.push({type:'text',text:'CURRENT_SHA256: '+hash+'\nNEXT_READ: '+JSON.stringify(next)});
+  return out;
+}
+
 async function editFiles(raw:unknown):Promise<ToolResult> {
   const a=EditFilesSchema.parse(raw);
   const paths=await Promise.all(a.files.map(f=>validatePath(f.path)));
@@ -160,13 +181,14 @@ async function editFiles(raw:unknown):Promise<ToolResult> {
       bytesTotal+=before.length;
       if(bytesTotal>16*1024*1024)throw new AgentError('BATCH_TOO_LARGE','Combined edit inputs exceed 16 MiB.');
       const beforeHash=sha256(before);
-      let content=decodeCode(before);
+      const original=decodeCode(before);
+      let content=original;
       const crlf=content.includes('\r\n');
       const normalize=(s:string)=>crlf?s.replace(/\r?\n/g,'\r\n'):s;
       const staleHash=beforeHash!==f.expected_sha256.toLowerCase();
       let safelyRebased=false;
       let alreadyApplied=true;
-      for(const e of f.edits){
+      for(const [editIndex,e] of f.edits.entries()){
         const old=normalize(e.old_string),next=normalize(e.new_string);
         const parts=content.split(old),count=parts.length-1;
         if(count===e.expected_replacements){
@@ -176,11 +198,13 @@ async function editFiles(raw:unknown):Promise<ToolResult> {
         }else if(count===0){
           const nextCount=content.split(next).length-1;
           if(nextCount!==e.expected_replacements)
-            throw new AgentError(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
-              `File ${i+1}: source changed and the exact edit cannot be proven safe (expected ${e.expected_replacements} old matches, found 0; replacement matches ${nextCount}). No files were written.`);
+            return editMismatch(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
+              `File ${i+1}: source changed and the exact edit cannot be proven safe (expected ${e.expected_replacements} old matches, found 0; replacement matches ${nextCount}). No files were written.`,
+              paths[i],beforeHash,original,old,i,editIndex,count);
         }else{
-          throw new AgentError(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
-            `File ${i+1}: expected ${e.expected_replacements} matches, found ${count}. No files were written.`);
+          return editMismatch(staleHash?'FILE_CONFLICT':'EDIT_MISMATCH',
+            `File ${i+1}: expected ${e.expected_replacements} matches, found ${count}. No files were written.`,
+            paths[i],beforeHash,original,old,i,editIndex,count);
         }
         if(Buffer.byteLength(content)>8*1024*1024)throw new AgentError('FILE_TOO_LARGE','Edited file would exceed 8 MiB.');
       }

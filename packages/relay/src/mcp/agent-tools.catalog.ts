@@ -47,6 +47,12 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
     "inputSchema": {
       "type": "object",
       "properties": {
+        "maxChars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 160000,
+          "description": "Combined text budget, default 32000 characters. Per-file pages stay compact; follow batch.continuations for omitted source."
+        },
         "paths": {
           "type": "array",
           "items": {
@@ -444,7 +450,14 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
       "type": "object",
       "properties": {
         "path": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
+        },
+        "maxChars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 128000,
+          "description": "Model-facing text budget, default 12000 characters. Follow read.next for contiguous pages; opt in to larger context only when needed."
         },
         "isUrl": {
           "type": "boolean",
@@ -518,7 +531,13 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
           "type": "integer",
           "minimum": 1,
           "maximum": 100000,
-          "default": 50000
+          "default": 12000
+        },
+        "maxChars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 100000,
+          "description": "Text budget for source line reads, default 12000. Larger reads require an explicit budget; follow next for contiguous source."
         }
       },
       "required": [

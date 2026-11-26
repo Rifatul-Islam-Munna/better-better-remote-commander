@@ -23,6 +23,7 @@ import {idempotentAppend} from '../../runtime/idempotent-append.js';
 import {listDirectoryPage} from '../../runtime/directory-page.js';
 import {missingFileResponse} from '../../runtime/path-diagnostics.js';
 import {moveFileSafely} from '../../runtime/safe-move.js';
+import {boundReadText,DEFAULT_READ_CHARS,DEFAULT_BATCH_READ_CHARS} from '../../runtime/read-budget.js';
 
 import {
     ReadFileArgsSchema,
@@ -86,7 +87,7 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
     const HANDLER_TIMEOUT = 3.5 * 60 * 1000; // 3m30s
     // Add input validation
     if (args === null || args === undefined) {
-        return createErrorResponse('No arguments provided for read_file command');
+        return failure(new AgentError('INVALID_ARGUMENT','Supply a nonempty path and optional bounded offset/length for read_file.'));
     }
     const readFileOperation = async () => {
         const parsed = ReadFileArgsSchema.parse(args);
@@ -241,7 +242,11 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
             }
             // A single enormous line can bypass a line-count limit and exhaust
             // a remote AI host's message stream. Bound the returned text too.
-            const maxChars = parsed.origin === 'ui' ? 256_000 : 128_000;
+            const maxChars = parsed.origin === 'ui' ? 256_000 : (parsed.maxChars??DEFAULT_READ_CHARS);
+            if(parsed.origin!=='ui'){
+                const page=boundReadText(textContent,parsed.path,parsed.offset??0,options.length??defaultLimit,maxChars);
+                return {content:[{type:'text',text:page.text}],structuredContent:{read:page.read}};
+            }
             const status = /^\[Reading (\d+) lines from[^\n]*\(total: (\d+) lines, (\d+) remaining\)\]/.exec(textContent);
             const characterTruncated = textContent.length > maxChars;
             if (characterTruncated)
@@ -329,7 +334,7 @@ export async function handleReadMultipleFiles(args: unknown): Promise<ServerResu
         (r.isPdf ? ' (PDF)' : r.isImage ? ' (image)' : ' (text)')).join('\n');
     // A bounded response is critical for large generated source (and image/PDF)
     // results. Never silently return incomplete content as a complete file.
-    let charsRemaining = 160_000, mediaBytesRemaining = 2 * 1024 * 1024;
+    let charsRemaining = parsed.maxChars??DEFAULT_BATCH_READ_CHARS, mediaBytesRemaining = 2 * 1024 * 1024;
     let truncated = omissions.size>0;
     const continuations: {path:string;next:unknown;reason:string}[] = [];
     const items: Array<{type:string;text?:string;data?:string;mimeType?:string}> = [];
@@ -348,17 +353,21 @@ export async function handleReadMultipleFiles(args: unknown): Promise<ServerResu
         const r=fileResults[i],entry=requested[i];
         if (r.error || r.content === undefined) continue;
         if(!r.isPdf&&!r.isImage) {
-            const info=/^\[Reading (\d+) lines from[^\n]*\(total: (\d+) lines, (\d+) remaining\)\]/.exec(r.content);
-            if(info&&Number(info[3])>0&&entry.offset>=0) {
+            const label='\n--- '+r.path+' ---\n';
+            if(charsRemaining<label.length+1000){
                 truncated=true;
-                continuations.push({path:r.path,reason:'Additional lines exist',
-                    next:{tool:'read_file',args:{path:r.path,offset:entry.offset+Number(info[1]),length:entry.length}}});
+                continuations.push({path:r.path,reason:'Combined text budget exhausted; this file was not returned',
+                    next:{tool:'read_file',args:{path:r.path,offset:entry.offset,length:entry.length,maxChars:DEFAULT_READ_CHARS}}});
+                continue;
             }
-            if(r.content.length>48_000) {
+            const page=boundReadText(r.content,r.path,entry.offset,entry.length,
+                Math.min(DEFAULT_READ_CHARS,Math.max(1000,charsRemaining-label.length-500)));
+            addText(label+page.text);
+            if(page.read.truncated){
                 truncated=true;
-                continuations.push({path:r.path,reason:'Character budget reached: a long line may have been cut',
-                    next:{tool:'read_code_file',args:{path:r.path,charOffset:0,charLength:50000}}});
+                continuations.push({path:r.path,reason:page.read.characterTruncated?'A source line exceeds the text budget':'More source lines exist',next:page.read.next});
             }
+            continue;
         }
         if (r.isPdf) {
             // In a batch, PDF extraction is limited to two pages per file.
@@ -422,17 +431,26 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
         const maxLines = Math.min(2000, Math.max(1, Math.trunc(config.fileWriteLineLimit ?? 1000)));
         const maxBytes = 1024 * 1024;
         const bytes = Buffer.byteLength(parsed.content, 'utf8');
+        let lineCount:number|undefined;
+        const limitFailure=(code:string,message:string)=>{
+            const out=failure(new AgentError(code,message));
+            return {...out,structuredContent:{...out.structuredContent,
+                write:{writeCommitted:false,receivedBytes:bytes,...(lineCount!==undefined?{receivedLines:lineCount}:{}),maxBytes,maxLines,
+                    recommendedChunkChars:DEFAULT_READ_CHARS,recommendedChunkLines:Math.min(250,maxLines)},
+                recovery:{automaticRetry:false,retryUnchanged:false,
+                    suggestion:'Nothing was written. For new files, send only the next compact chunk with explicit rewrite/append mode. For existing source, prefer focused hash-checked edit_block/edit_files changes; do not replay successful chunks.'}}};
+        };
         if (bytes > maxBytes)
-            throw new AgentError('WRITE_SIZE_LIMIT',
+            return limitFailure('WRITE_SIZE_LIMIT',
                 'No file changed: ' + bytes + ' bytes exceeds the 1 MiB write_file limit. ' +
-                'Split new files into mode=rewrite then mode=append chunks, or use workspace_batch for hash-checked edits.');
-        const lineCount = parsed.content === '' ? 0 :
+                'Split new files into mode=rewrite then mode=append chunks, or use edit_block/edit_files for focused edits.');
+        lineCount = parsed.content === '' ? 0 :
             parsed.content.split(/\r\n|\r|\n/).length - (/[\r\n]$/.test(parsed.content) ? 1 : 0);
         if (lineCount > maxLines)
-            throw new AgentError('WRITE_LINE_LIMIT',
+            return limitFailure('WRITE_LINE_LIMIT',
                 'No file changed: ' + lineCount + ' lines exceeds your ' + maxLines +
                 '-line fileWriteLineLimit (hard max: 2000). Use smaller mode=append chunks, ' +
-                'or raise fileWriteLineLimit with set_config_value. Existing files require explicit mode.');
+                'or focused edit_block/edit_files changes. Existing files require explicit mode.');
 
         // Prevent silent accidental overwrites. A caller intending to append
         // must not destroy a nonempty file by forgetting the mode parameter.
@@ -441,7 +459,7 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
             if (existing?.isFile && existing.size > 0)
                 throw new AgentError('WRITE_MODE_REQUIRED',
                     'No file changed: existing file has ' + existing.size +
-                    ' bytes. Explicitly set mode=append or mode=rewrite. For precise edits, use edit_block or workspace_batch.');
+                    ' bytes. Explicitly set mode=append or mode=rewrite. For precise edits, use edit_block or edit_files.');
         }
 
         const receipt=parsed.mode==='append'&&parsed.append_id

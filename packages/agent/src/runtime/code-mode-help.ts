@@ -12,6 +12,7 @@ const parallelism = {
 };
 const features = [
   {api:'tools.search(query), tools.describe(name), tools.call(name,args)',use:'Discover exact schemas for permitted native and installed-plugin tools. Replies expose text, structuredContent, isError and pending.'},
+  {api:'tools.call("read_code_file",{path,offset,length,maxChars}), tools.call("read_multiple_files",{paths,maxChars})',use:'Compact defaults: 12000 source characters / 32000 combined batch text. Source lives in structuredContent.text with sha256 and exact next cursor; follow next without restarting. Explicit larger budgets may produce result handles. Return only needed source/context, not duplicate full replies.'},
   {api:'tools.parallelSafe(calls,options)',use:'Real bounded parallel read DAGs; see tools.help("parallelism").'},
   {api:'tools.semantic.search({path,query,offset,limit,preview_chars})',use:'Page local semantic/hybrid project retrieval; follow continuation.next. Retrieval is not compiler-semantic proof.'},
   {api:'tools.workflows.match(query), tools.workflows.run(query,context)',use:'Match/reuse an unambiguous saved workflow; inspect unfamiliar source via snippets.get. Saved code grants no permission.'},

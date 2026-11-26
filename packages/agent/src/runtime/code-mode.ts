@@ -39,7 +39,7 @@ import {adaptiveTaskConcurrency} from './task-parallelism.js';
 import {compactModelState} from './model-state-compression.js';
 import {SourceObservationLedger} from './stale-source-guard.js';
 import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} from './recovery-capsule.js';
-import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText} from './adaptive-result-budget.js';
+import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText,compactStructured} from './adaptive-result-budget.js';
 import {getVerificationEvidence,isTrackedMutation,isVerificationOperation} from './verification-evidence.js';
 import {SpecialistRoutingPolicy,specialistPolicyStatus} from './specialist-policy.js';
 import {codeModeHelp,CODE_MODE_HELP_TOPICS} from './code-mode-help.js';
@@ -280,19 +280,31 @@ async function toolReply(result:ToolResult,label:string):Promise<{value:Record<s
     ...(result.structuredContent?{structuredContent:result.structuredContent}:{})
   };
   const budget=adaptiveToolBudget(label,result);
-  const handle=await maybePutResultHandle(fullValue,label,budget.handleThreshold).catch(()=>null);
+  // Complete compact source pages need no duplicate saved-result round trip.
+  // Explicit large reads still retain their omitted content behind a handle.
+  const compactRead=label==='read_code_file'&&typeof result.structuredContent?.text==='string'
+    ?result.structuredContent.text.length<=12_000
+    :['read_file','read_multiple_files'].includes(label)&&textContent.length<=budget.textBudget;
+  const fullMetadataFits=limited(result.structuredContent,32_001).length<=32_000;
+  const handle=compactRead&&fullMetadataFits?null:
+    await maybePutResultHandle(fullValue,label,budget.handleThreshold).catch(()=>null);
   const projected=projectAdaptiveToolResult(label,result,textContent,!!handle);
   let value:Record<string,unknown>={
     text:projected.text.slice(0,MAX_TOOL_TEXT),
     isError:!!result.isError,pending:result.structuredContent?.pending===true,mediaOmitted,
     ...(projected.structuredContent?{structuredContent:projected.structuredContent}:{}),
     resultBudget:{textChars:budget.textBudget,handleThreshold:budget.handleThreshold,adaptive:true},
-    ...(handle?{resultHandle:handle}:{})
+    ...(handle?{resultHandle:handle,continuation:{required:true,stayInCodeMode:true,
+      next:{method:'tools.results.get',args:[handle.id,{offset:0,length:12000}]},
+      note:'This is a compact preview. Retrieve omitted local content before deriving edits; source next offsets describe the source page.'}}:{})
   };
-  let truncated=!!handle||projected.text.length<textContent.length||textContent.length>MAX_TOOL_TEXT;
+  let truncated=!(compactRead&&fullMetadataFits)&&
+    (!!handle||textContent.length>budget.textBudget||textContent.length>MAX_TOOL_TEXT);
+  if(truncated)value.outputTruncated=true;
   if(limited(value,MAX_TOOL_RESPONSE).length>=MAX_TOOL_RESPONSE){
     value={text:projected.text.slice(0,MAX_SOURCE_OUTPUT),
       isError:!!result.isError,pending:result.structuredContent?.pending===true,
+      ...(projected.structuredContent?{structuredContent:compactStructured(projected.structuredContent,label)}:{}),
       outputTruncated:true,mediaOmitted,resultBudget:{textChars:MAX_SOURCE_OUTPUT,adaptive:true},
       ...(handle?{resultHandle:handle}:{}),
       note:handle

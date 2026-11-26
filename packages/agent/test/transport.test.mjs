@@ -37,6 +37,17 @@ test('real MCP coding workflow, cancellation and bounded live diagnostics',{time
  try{
   await until(()=>relay.hub.list().length===1);
   await rpc('initialize',{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'integration-test',version:'1'}});
+  await t.test('compact source pages retain editable hashes and cursors inside Code Mode over MCP',async()=>{
+   const file=path.join(project,'large-source.ts'),source='// start\n'+'export const padding = "'+'A'.repeat(40000)+'";\n';
+   await fs.writeFile(file,source);
+   const read=await tool('read_file',{path:file,length:10,maxChars:1000});
+   assert.equal(read.isError,false);assert.ok(read.content[0].text.length<1600);assert.ok(read.structuredContent.read.next);
+   const r=await tool('code_mode',{source:'const r=await tools.call("read_code_file",{path:'+JSON.stringify(file)+',maxChars:50000}); return {sha:r.structuredContent.sha256,source:r.structuredContent.text.length,next:r.structuredContent.next.args.charOffset,handle:!!r.resultHandle};'});
+   assert.equal(r.isError,false,JSON.stringify(r));
+   assert.equal(r.structuredContent.result.sha,(await import('node:crypto')).createHash('sha256').update(source).digest('hex'));
+   assert.equal(r.structuredContent.result.source,12000);assert.equal(r.structuredContent.result.next,12000);
+   assert.equal(r.structuredContent.result.handle,true);
+  });
   await t.test('new tool definitions and exact snapshots traverse MCP',async()=>{
    const d=await rpc('tools/list',{});
    assert.ok(d.tools.some(x=>x.name==='edit_block') && d.tools.some(x=>x.name==='agent_status'));

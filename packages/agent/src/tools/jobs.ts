@@ -1047,13 +1047,14 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
     const queued=batch.filter(job=>job.status==='queued').length;
     const completed=batch.filter(isFinished).length;
     const failed=batch.filter(job=>isFinished(job)&&job.status!=='succeeded').length;
-    const limit=Math.min(adaptive.effective,systemPressureStatus().suggestedSafeParallelism);
+    const capacity=Math.min(MAX_CONCURRENT_JOBS,systemPressureStatus().suggestedSafeParallelism);
+    const limit=Math.min(adaptive.effective,capacity);
     observedPeakConcurrency=Math.max(observedPeakConcurrency,active);
-    const signature=[active,queued,completed,failed,limit].join(':');
+    const signature=[active,queued,completed,failed,limit,capacity].join(':');
     if(signature!==lastProgress){
       lastProgress=signature;
       try{activity.parallel('jobs',group,{active,queued,completed,total:batch.length,
-        limit,peak:observedPeakConcurrency,failed});}catch{}
+        limit,capacity,peak:observedPeakConcurrency,failed});}catch{}
     }
     if(completed===batch.length)for(const job of batch)delete job.parallelProgress;
   };

@@ -36,12 +36,13 @@ test('live parallel counters remain visible in every console mode without changi
  const log=new ActivityLog(undefined,false);
  const resume=log.pauseConsole();
  try{
-  log.parallel('jobs','par-fixture-abcdef',{active:2,limit:3,queued:1,completed:0,total:3,peak:2});
+  log.parallel('jobs','par-fixture-abcdef',{active:2,limit:3,capacity:6,queued:1,completed:0,total:3,peak:2});
   const event=log.recent().at(-1);
   for(const mode of ['mymcp','compact','detailed','verbose']){
    const line=formatActivityEvent(event,mode,160);
    assert.match(line,/⚡ PARALLEL JOBS #abcdef/);
    assert.match(line,/active 2\/3.*queued 1.*done 0\/3.*peak 2/);
+   assert.match(line,/capacity 6.*active 2\/3/);
   }
   assert.match(log.consoleQueue.join(''),/⚡ PARALLEL JOBS/);
   assert.equal(log.status().started,0);assert.equal(log.status().finished,0);

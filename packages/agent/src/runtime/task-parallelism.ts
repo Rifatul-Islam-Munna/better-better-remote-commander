@@ -38,15 +38,14 @@ export function adaptiveTaskConcurrency(calls:readonly StepLike[],requested=MAX_
   const counts=Object.fromEntries([...new Set(classes)].map(c=>[c,classes.filter(x=>x===c).length])) as Partial<Record<WorkloadClass,number>>;
   const heavy=(counts.build??0)+(counts.verification??0);
   let base=lightweightConcurrencyLimit();
-  if(classes.length<=1)base=1;
-  else if(classes.every(c=>c==='build'||c==='verification'))base=1;
+  if(classes.every(c=>c==='build'||c==='verification'))base=1;
   else if(heavy>0)base=2; // one heavy lane + one responsive/light lane
   else if((counts.mutation??0)>0)base=2;
   else if((counts.semantic??0)>0)base=2;
   else if((counts.plugin??0)>0&&classes.every(c=>c==='plugin'))base=2;
-  const effective=Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,Math.trunc(requested)||1,base,
-    Math.max(1,calls.length),pressure.suggestedSafeParallelism));
-  return {requested:Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,Math.trunc(requested)||1)),effective,classes,counts,pressure:pressure.level,
+  const available=Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,base,pressure.suggestedSafeParallelism));
+  const effective=Math.max(1,Math.min(Math.trunc(requested)||1,Math.max(1,calls.length),available));
+  return {requested:Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,Math.trunc(requested)||1)),available,effective,classes,counts,pressure:pressure.level,
     policy:heavy>0?'Heavy verification/build work keeps one slot while allowing at most one light companion lane.':
       (counts.mutation??0)>0?'Mutation groups are capped at two; file/path locks remain authoritative.':
       'Lightweight fanout scales with hardware: up to six normally, three under moderate pressure, two under high pressure, one under critical pressure.'};

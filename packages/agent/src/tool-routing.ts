@@ -447,7 +447,8 @@ export function addToolChoice<T extends { name: string; description: string }>(t
   if (!rule) throw new Error('Missing MCP tool choice rule for ' + tool.name);
   // The primary execution surface needs its complete, shared onboarding.
   // Never hide parallelism/features behind the generic 870-character clip.
-  if(tool.name==='code_mode')return {...tool,description:CODE_MODE_DISCOVERY_DESCRIPTION+
+  // Omit the legacy fixed-three sample option; local admission is adaptive.
+  if(tool.name==='code_mode')return {...tool,description:CODE_MODE_DISCOVERY_DESCRIPTION.replace(',{max_concurrency:3}','')+
     '\nPARALLEL FIRST: Prefer tools.parallelSafe for suitable independent reads/searches/commands; submit independent outer code_mode workflows concurrently when supported. Await dependencies and serialize competing writes.'};
   const guide = 'USE WHEN: ' + rule.use +
     '\nUSE INSTEAD: ' + rule.instead +

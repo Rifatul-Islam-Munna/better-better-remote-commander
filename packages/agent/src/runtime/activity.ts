@@ -19,7 +19,7 @@ process.stdout.on('error', () => { stdoutAvailable = false; });
 export type ConsoleMode = 'mymcp' | 'compact' | 'detailed' | 'verbose';
 export interface ParallelProgress {
     active:number;limit:number;queued:number;peak:number;
-    completed?:number;total?:number;parked?:number;failed?:number;
+    completed?:number;total?:number;parked?:number;failed?:number;capacity?:number;
 }
 export interface ActivityEvent {
     timestamp: string;
@@ -258,7 +258,8 @@ export class ActivityLog {
     parallel(scope:'jobs'|'workflows',id:string,counts:ParallelProgress):void {
         const n=(value:number|undefined)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0?Math.min(value,1_000_000):0;
         const label=scope==='jobs'?'PARALLEL JOBS #'+safeId(id).slice(-6):'CODE MODE';
-        const message='⚡ '+label+' | active '+n(counts.active)+'/'+n(counts.limit)+
+        const message='⚡ '+label+(counts.capacity===undefined?'':' | capacity '+n(counts.capacity))+
+            ' | active '+n(counts.active)+'/'+n(counts.limit)+
             ' | queued '+n(counts.queued)+
             (scope==='jobs'?' | done '+n(counts.completed)+'/'+n(counts.total):' | parked '+n(counts.parked))+
             ' | peak '+n(counts.peak)+(counts.failed?' | failed '+n(counts.failed):'');

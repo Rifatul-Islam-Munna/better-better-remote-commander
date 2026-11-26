@@ -51,5 +51,8 @@ test('real pressure sampler and task policy apply six-to-one limits and respect 
  }
  os.freemem=()=>20*GiB;
  assert.equal(adaptiveTaskConcurrency(calls,3).effective,3);
+ const single=adaptiveTaskConcurrency(calls.slice(0,1));
+ assert.equal(single.available,6,'available capacity must not shrink to the submitted call count');
+ assert.equal(single.effective,1,'capacity must not invent additional work');
  assert.equal(adaptiveTaskConcurrency([{tool:'run_command',args:{command:'pnpm build'}},{tool:'run_project_checks'}],6).effective,1);
 });

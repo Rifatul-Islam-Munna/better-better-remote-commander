@@ -173,6 +173,17 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    for(const [i,value]of result.structuredContent.result.texts.entries())assert.match(value,new RegExp('six-way-fixture-'+i));
    assert.ok(activity.recent().some(e=>e.level==='parallel'&&/PARALLEL JOBS.*active 6\/6/.test(e.message)));
   });
+  await t.test('three-call batches report six-slot capacity even when the guest returns only mapped text',async()=>{
+   reset(3);
+   const calls=Array.from({length:3},(_,i)=>({tool:'read_file',args:{token:'explicit-three-'+i}}));
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+',{max_concurrency:3});return r.results.map(v=>v.text);'});
+   assert.equal(result.isError,false,JSON.stringify(result));assert.equal(peak,3,'explicit caller limit must be preserved');
+   assert.deepEqual({...result.structuredContent.parallelism,guidance:undefined},
+    {capacity:6,submitted:3,requested:3,batchLimit:3,pressure:'normal',batches:1,guidance:undefined});
+   assert.match(result.content[0].text,/PARALLEL PLAN \| capacity 6 \| submitted 3 \| requested 3 \| batch limit 3/);
+   assert.match(result.structuredContent.parallelism.guidance,/more independent work/);
+   assert.ok(activity.recent().some(e=>e.level==='parallel'&&/capacity 6.*active 3\/3/.test(e.message)));
+  });
   await t.test('six worker slots still serialize CPU-heavy work beside five light reads',async()=>{
    reset(6);
    const calls=[{tool:'code_graph',args:{token:'heavy-a'}},
@@ -265,6 +276,8 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
     const execution=JSON.parse(await fs.readFile(path.join(store,file),'utf8'));
     for(const step of execution.steps.filter(s=>s.tool==='run_parallel'))
      assert.equal(step.reply?.value?.results,undefined,'projected child results must not enter the durable ledger');
+    for(const step of execution.steps.filter(s=>s.tool==='run_parallel'))
+     assert.equal(step.reply?.value?.parallelism,undefined,'capacity feedback must remain outside durable tool replies');
    }
   });
   await t.test('parallelSafe bounds source replies and retains exact continuation metadata',async()=>{

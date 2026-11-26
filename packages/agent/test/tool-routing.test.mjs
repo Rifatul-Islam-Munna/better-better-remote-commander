@@ -96,6 +96,7 @@ test('the tool-routing helper changes descriptions ONLY, not names, schema or ac
 test('Code Mode parallelism and feature discovery survive description compaction',()=>{
  const d=byName.get('code_mode').description;
  assert.match(d,/PARALLEL FIRST/);
+ assert.doesNotMatch(d,/max_concurrency:3[},]/);
  for(const term of ['tools.help','tools.parallelSafe','12 admitted / 8 runnable','semantic','result handles','specialists','fibers','sequential'])assert.ok(d.includes(term),'missing onboarding: '+term);
  assert.equal(addToolChoice({name:'code_mode',description:'stale legacy text'}).description,d);
  assert.ok(d.length<2600,'primary onboarding stays bounded');

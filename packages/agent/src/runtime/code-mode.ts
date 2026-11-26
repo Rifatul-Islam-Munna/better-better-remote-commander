@@ -341,6 +341,15 @@ export async function executeCodeMode(
   let closed=false;
   let calls=0;
   let discoveries=0;
+  let parallelBatchCount=0;
+  let lastParallelPlan:{capacity:number;submitted:number;requested:number;batchLimit:number;pressure:string}|undefined;
+  const parallelFeedback=()=>lastParallelPlan?{
+    ...lastParallelPlan,batches:parallelBatchCount,
+    ...(lastParallelPlan.batchLimit<lastParallelPlan.capacity?{guidance:
+      'Capacity '+lastParallelPlan.capacity+'; this request supplied '+lastParallelPlan.submitted+
+      ' calls with max_concurrency '+lastParallelPlan.requested+'. If more independent work is known, submit up to '+
+      lastParallelPlan.capacity+' together and omit max_concurrency. Do not duplicate work to fill slots.'}:{}),
+  }:undefined;
   // Only parent-issued bridge errors may supply a diagnostic cause code.
   // Bounded and workflow-local; guest-authored error.code is never trusted.
   const bridgeFailures=new Map<string,string>();
@@ -726,6 +735,9 @@ export async function executeCodeMode(
       const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):MAX_LIGHTWEIGHT_PARALLELISM;
       const adaptive=adaptiveTaskConcurrency(safeCalls,requested);
       const maxConcurrency=adaptive.effective;
+      lastParallelPlan={capacity:adaptive.available,submitted:safeCalls.length,
+        requested:adaptive.requested,batchLimit:maxConcurrency,pressure:adaptive.pressure};
+      parallelBatchCount++;
       // Deliver ordered child replies in RAM, after the normal dispatcher has
       // executed them. Keep the aggregate extra payload below 24k characters.
       const results:Array<Record<string,unknown>|null>=safeCalls.map(()=>null);
@@ -764,6 +776,7 @@ export async function executeCodeMode(
         }));
         // Do not mutate the reply referenced by the durable step ledger.
         parallelReply={...reply,value:{...value,results:projectedResults,
+          parallelism:parallelFeedback(),
           ...(commandCalls?{parallelRouting:'run_parallel',commandCalls}:{})}};
       }
       if(reply.ok)for(const call of safeCalls)if(call.tool!=='run_command')
@@ -1305,8 +1318,12 @@ export async function executeCodeMode(
             (continuation?.required?' | stay in code_mode':'')+
             (resumed?' | durable resume':'')+
             (pending?' | inspect jobs: '+pendingJobs.join(', '):'');
+          const parallelism=parallelFeedback();
+          const parallelLine=parallelism?'\nPARALLEL PLAN | capacity '+parallelism.capacity+
+            ' | submitted '+parallelism.submitted+' | requested '+parallelism.requested+
+            ' | batch limit '+parallelism.batchLimit+'\n'+(parallelism.guidance??''):'';
           const out:ToolResult={
-            content:[{type:'text',text:summary+'\n'+rendered}],
+            content:[{type:'text',text:summary+parallelLine+'\n'+rendered}],
             structuredContent:{
               result:outputTruncated?undefined:resultValue,...(finalHandle?{resultHandle:finalHandle}:{}),
               steps,completedCalls:steps.length,
@@ -1317,6 +1334,7 @@ export async function executeCodeMode(
               scheduler:{waitedMs:schedulerLease.waitedMs,activeLimitAtStart:schedulerLease.activeLimitAtStart},
               retries:trace.record.retries,replayedSteps:trace.record.replayedSteps,
               specialistPolicy:specialistPolicy.summary(),
+              ...(parallelism?{parallelism}:{}),
               modelState:modelState(status,outputTruncated),
               ...(continuation?{continuation}:{}),
               storage:{harnessStateMaxBytes:30*1024*1024,semanticCacheMaxBytes:64*1024*1024},

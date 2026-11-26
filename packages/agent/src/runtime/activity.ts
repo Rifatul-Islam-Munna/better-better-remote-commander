@@ -17,6 +17,10 @@ export const MAX_ACTIVITY_CONSOLE_BYTES = MAX_ACTIVITY_EVENT_BYTES;
 let stdoutAvailable = true;
 process.stdout.on('error', () => { stdoutAvailable = false; });
 export type ConsoleMode = 'mymcp' | 'compact' | 'detailed' | 'verbose';
+export interface ParallelProgress {
+    active:number;limit:number;queued:number;peak:number;
+    completed?:number;total?:number;parked?:number;failed?:number;
+}
 export interface ActivityEvent {
     timestamp: string;
     level: string;
@@ -122,6 +126,7 @@ export function formatActivityEvent(event: ActivityEvent, mode: ConsoleMode, wid
     const time = new Date(event.timestamp).toLocaleTimeString('en-GB',{hour12:false});
     const max = Math.min(160,Math.max(40,width));
     if (!event.phase) {
+        if(event.level==='parallel')return compactLine('['+time+'] '+event.message,max);
         if (mode==='mymcp') {
             const heartbeat=event.message.startsWith('Heartbeat | ');
             const label=(heartbeat?'status':event.level).slice(0,20).padEnd(20,' ');
@@ -136,11 +141,13 @@ export function formatActivityEvent(event: ActivityEvent, mode: ConsoleMode, wid
     const duration = event.ms === undefined ? '' : '  '+(event.ms >= 1000
         ? (event.ms / 1000).toFixed(1)+'s' : Math.round(event.ms)+'ms');
     const legacyTool = /^\s*(?:START|OK|ERROR|PENDING)\s+([a-z][a-z0-9_]*)\b/i.exec(event.message)?.[1];
-    const label = '['+time+'] ['+state+'] '+(event.tool??legacyTool??'operation')+duration;
+    const parallel=event.tool==='run_parallel'||event.tool==='parallel_safe';
+    const label = '['+time+'] '+(parallel?'⚡ ':'')+'['+state+'] '+(event.tool??legacyTool??'operation')+duration;
     if (mode === 'mymcp') {
         // A few readable lines like a tool receipt: no JSON, code or full output.
         const stamp='['+time+']';
         const name=event.tool??legacyTool??'operation';
+        const call=parallel?'Parallel call ':'Tool call ';
         const preview=minimalPreview(event.trace);
         const id='#'+(event.id?.slice(0,8)??'unknown');
         const took=event.ms===undefined?'':' • '+(event.ms>=1000
@@ -151,20 +158,20 @@ export function formatActivityEvent(event: ActivityEvent, mode: ConsoleMode, wid
         if(event.phase==='START'){
             const specialist=preview.specialist?'\n    Specialist: '+compactLine(preview.specialist,90):'';
             const routing=preview.routing?'\n    Routing: '+compactLine(preview.routing,16):'';
-            return stamp+' 🔧 Tool call '+name+' started  '+id+specialist+routing;
+            return stamp+(parallel?' ⚡ ':' 🔧 ')+call+name+' started  '+id+specialist+routing;
         }
         const receipt='\n    Call '+id+took;
         const heading='\n    Result preview\n    ';
         const detail=preview.detail?' • '+preview.detail:'';
-        if(event.phase==='OK')return stamp+' ✅ Tool call '+name+' completed'+receipt+
+        if(event.phase==='OK')return stamp+(parallel?' ⚡ ✅ ':' ✅ ')+call+name+' completed'+receipt+
             heading+(preview.summary??'Tool completed successfully')+detail+context;
-        if(event.phase==='PENDING')return stamp+' ⏳ Tool call '+name+' running'+receipt+
+        if(event.phase==='PENDING')return stamp+(parallel?' ⚡ ⏳ ':' ⏳ ')+call+name+' running'+receipt+
             heading+(preview.summary??'Operation is still running')+detail+context;
         const code=preview.detail??event.code??'TOOL_FAILED';
         const generic=/tool failed; inspect its structured error and recovery guidance/i;
         const hint=preview.hint??(event.note&&!generic.test(event.note)
             ?compactLine(event.note,105):undefined);
-        return stamp+' ❌ Tool call '+name+' failed'+receipt+heading+
+        return stamp+(parallel?' ⚡ ❌ ':' ❌ ')+call+name+' failed'+receipt+heading+
             'Operation failed • '+compactLine(code,100)+
             (hint?'\n    Next: '+compactLine(hint,125):'')+context;
     }
@@ -246,6 +253,16 @@ export class ActivityLog {
         if (level === 'debug' && process.env.BRC_DEBUG !== '1')
             return;
         this.record({ timestamp: new Date().toISOString(), level, message: compactLine(message) });
+    }
+    /** Scheduler-owned counts only. Live/RAM-only; never a tool transcript. */
+    parallel(scope:'jobs'|'workflows',id:string,counts:ParallelProgress):void {
+        const n=(value:number|undefined)=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0?Math.min(value,1_000_000):0;
+        const label=scope==='jobs'?'PARALLEL JOBS #'+safeId(id).slice(-6):'CODE MODE';
+        const message='⚡ '+label+' | active '+n(counts.active)+'/'+n(counts.limit)+
+            ' | queued '+n(counts.queued)+
+            (scope==='jobs'?' | done '+n(counts.completed)+'/'+n(counts.total):' | parked '+n(counts.parked))+
+            ' | peak '+n(counts.peak)+(counts.failed?' | failed '+n(counts.failed):'');
+        this.log('parallel',message);
     }
     tool(phase: 'START' | 'OK' | 'ERROR' | 'PENDING', tool: string, id: string, ms?: number, code?: string, action?: string, note?: string, trace?: string): void {
         tool = safeId(tool);

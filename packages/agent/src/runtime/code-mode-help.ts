@@ -2,7 +2,7 @@
 import {CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_RUNNABLE} from 'brc-shared';
 
 const parallelism = {
-  default:'Prefer parallel Code Mode for independent coding work: parallelSafe for eligible reads/searches and explicit run_command calls, concurrent outer code_mode calls for independent workflows when supported by the host. Await dependencies and serialize overlapping writes.',
+  default:'PARALLEL FIRST: Prefer parallel Code Mode for suitable independent coding work. Start independent reads/searches and explicit run_command calls with parallelSafe; submit independent outer code_mode workflows concurrently when the host supports it. Use sequential calls for dependencies or competing writes.',
   safeReads:'await tools.parallelSafe([{tool:"git_status",args:{path:root}},{tool:"git_diff",args:{path:root}}],{max_concurrency:3})',
   searches:'await tools.parallelSafe([{tool:"start_search",args:{path:root,pattern:"TODO",searchType:"content",wait:true,maxResults:20}},{tool:"start_search",args:{path:root,pattern:"test",searchType:"files",wait:true,maxResults:20}}],{max_concurrency:3})',
   results:'parallelSafe returns an envelope: reply.results contains bounded replies in input order (text, structuredContent, isError, pending, jobId). reply.map(fn) maps those replies too. Read source from item.structuredContent.text; check outputTruncated/resultUnavailable and follow source next or get_job. Summary remains in reply.structuredContent. This is not an array of full unbounded results.',
@@ -12,6 +12,7 @@ const parallelism = {
   ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts independent verified reads, blocking start_search (omitted wait defaults to true) and explicit run_command calls; it rejects explicit wait:false, direct file mutations, search cursors and job-control tools before starting any calls. depends_on:[0] refers to an earlier call.',
   safety:'Await dependent reads before edits; serialize overlapping writes. Reduce fanout under pressure. Capacity is not a target worker count.',
   completion:'Inspect response.structuredContent, pending and actual exitCode. Follow get_job/wait_jobs for pending work; never rerun completed mutations to retrieve output.',
+  liveConsole:'⚡ marks parallel calls. Live PARALLEL JOBS counters show active jobs, limit, queued, done and observed peak. CODE MODE counters show active/queued/parked workflows. These count scheduled jobs/workflows, not OS threads.',
 };
 const features = [
   {api:'tools.search(query), tools.describe(name), tools.call(name,args)',use:'Discover exact schemas for permitted native and installed-plugin tools. Replies expose text, structuredContent, isError and pending.'},

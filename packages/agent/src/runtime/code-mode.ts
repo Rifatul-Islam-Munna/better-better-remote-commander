@@ -56,7 +56,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'QuickJS body ending with return. Start with await tools.help(); default to tools.parallelSafe for independent reads/searches and explicit run_command calls, or concurrent outer code_mode calls when the host supports them. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
+    'PARALLEL FIRST for suitable independent coding work: tools.parallelSafe for reads/searches/explicit run_command calls, concurrent outer code_mode calls when the host supports them. Await dependencies; serialize competing writes. Start with await tools.help(). Features: tools.help("features"). Ordinary calls/specialists stay sequential. QuickJS body ending with return; no Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(

@@ -263,6 +263,8 @@ interface Job {
   quickResult?: ServerResult;
   /** Request-local result delivery only; never persisted or retained after a parallel wait. */
   captureResult?: (result:ServerResult)=>void;
+  /** Live status publisher; callback is never persisted. */
+  parallelProgress?: ()=>void;
   consoleOutcome?: CommandActivityResult;
   consoleTrace?: string;
   progress?: CommandProgress;
@@ -284,6 +286,9 @@ const runningFileIo: Array<{ jobId: string; access: { paths: string[]; mutating:
 let historyLoaded = false;
 
 const isFinished = (j: Job) => j.status !== 'queued' && j.status !== 'running';
+function notifyParallelProgress(job:Job):void {
+  try{job.parallelProgress?.();}catch{/* Console diagnostics never change job execution. */}
+}
 const jobsDir = () => path.join(homeDir(), 'jobs');
 
 function newId(): string {
@@ -386,6 +391,7 @@ async function runJob(job: Job): Promise<void> {
   if (job.status !== 'queued') return;
   job.status = 'running';
   job.startedAt = Date.now();
+  notifyParallelProgress(job);
   void persist(job); // restart recovery can identify an interrupted in-flight step
   const signal = job.abort!.signal;
   const timer = setTimeout(() => { job.timedOut = true; job.abort!.abort(); }, job.timeoutMs);
@@ -462,6 +468,7 @@ async function runJob(job: Job): Promise<void> {
     // A completed wait_jobs/get_job receipt must not race the final disk
     // checkpoint. Persist atomically before notifying waiting callers.
     await persist(job);
+    notifyParallelProgress(job);
     job.resolveDone!();
     prune();
   }
@@ -512,6 +519,7 @@ function markInternalJobFailure(job:Job,error:unknown):void {
   job.endedAt=Date.now();
   job.currentStep=-1;
   job.results.push({index:job.results.length,name:'internal job execution',ok:false,ms:0,output:'JOB_FAILED: '+message});
+  notifyParallelProgress(job);
   job.resolveDone?.();
 }
 
@@ -535,6 +543,7 @@ function pump(): void {
           candidate.status='failed';candidate.endedAt=Date.now();
           candidate.results.push({index:0,name:'dependency validation',ok:false,ms:0,
             output:'DEPENDENCY_FAILED: A required predecessor did not succeed or is missing. This step was NOT executed. Inspect the previous job; no automatic retry.'});
+          notifyParallelProgress(candidate);
           void persist(candidate).finally(()=>{candidate.resolveDone?.();pump();});
           continue;
         }
@@ -579,6 +588,7 @@ function cancel(job: Job): boolean {
   if (job.status === 'queued') {
     job.status = 'cancelled';
     job.endedAt = Date.now();
+    notifyParallelProgress(job);
     job.resolveDone?.();
     void persist(job);
   } else {
@@ -591,7 +601,7 @@ function cancel(job: Job): boolean {
 // Persistence (best effort)
 // ---------------------------------------------------------------------------
 function serialisable(job: Job) {
-  const { abort, done, resolveDone, cancelRequested, timedOut, quickReturnPending, quickResult, captureResult,
+  const { abort, done, resolveDone, cancelRequested, timedOut, quickReturnPending, quickResult, captureResult, parallelProgress,
     progress, consoleOutcome, consoleTrace, ownerClient, ownerRemote, ...rest } = job;
   // Completed/interrupted jobs are never replayed from disk. Do not persist
   // arbitrary shell strings, plugin args, edit text, or secrets in job history.
@@ -1030,6 +1040,23 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
   await Promise.all(batch.map(job=>persist(job)));
   const origin=getCallContext();
   if(origin?.remote)await linkCallJobs(origin.id,batch.map(job=>job.id));
+  let observedPeakConcurrency=0,lastProgress='';
+  const publishProgress=()=>{
+    const active=batch.filter(job=>job.status==='running').length;
+    const queued=batch.filter(job=>job.status==='queued').length;
+    const completed=batch.filter(isFinished).length;
+    const failed=batch.filter(job=>isFinished(job)&&job.status!=='succeeded').length;
+    observedPeakConcurrency=Math.max(observedPeakConcurrency,active);
+    const signature=[active,queued,completed,failed].join(':');
+    if(signature!==lastProgress){
+      lastProgress=signature;
+      try{activity.parallel('jobs',group,{active,queued,completed,total:batch.length,
+        limit:adaptive.effective,peak:observedPeakConcurrency,failed});}catch{}
+    }
+    if(completed===batch.length)for(const job of batch)delete job.parallelProgress;
+  };
+  for(const job of batch)job.parallelProgress=publishProgress;
+  publishProgress();
   // Feed the shared scheduler: at most three workers globally, one CPU-heavy
   // job at a time, and lightweight work can pass a queued heavy job.
   for (const job of batch) enqueue(job);

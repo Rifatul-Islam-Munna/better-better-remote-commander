@@ -9,6 +9,7 @@ import os from 'node:os';
 import {AgentError} from './errors.js';
 import {systemPressureStatus} from './system-pressure.js';
 import {CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_RUNNABLE} from 'brc-shared';
+import {activity} from './activity.js';
 
 const MAX_ADMITTED=CODE_MODE_MAX_ADMITTED;
 const HARD_MAX_ACTIVE=CODE_MODE_MAX_RUNNABLE;
@@ -85,6 +86,24 @@ class CodeModeScheduler {
   private maxObservedActive=0;
   private maxObservedAdmitted=0;
   private totalWaitMs=0;
+  private parallelVisible=false;
+  private lastLiveProgress='';
+
+  private publishProgress(){
+    if(this.workflows.size>1)this.parallelVisible=true;
+    if(!this.parallelVisible)return;
+    const records=[...this.workflows.values()];
+    const active=records.filter(w=>w.state==='active').length;
+    const queued=records.filter(w=>w.state==='queued').length;
+    const parked=records.filter(w=>w.state==='parked').length;
+    const limit=dynamicLimit().activeLimit;
+    const signature=[active,queued,parked,limit].join(':');
+    if(signature!==this.lastLiveProgress){
+      this.lastLiveProgress=signature;
+      try{activity.parallel('workflows','code-mode',{active,queued,parked,limit,peak:this.maxObservedActive});}catch{}
+    }
+    if(!records.length){this.parallelVisible=false;this.lastLiveProgress='';}
+  }
 
   private activeRecords(){
     return [...this.workflows.values()].filter(w=>w.state==='active');
@@ -108,6 +127,7 @@ class CodeModeScheduler {
     record.waitedMs+=waited;
     this.totalWaitMs+=waited;
     this.maxObservedActive=Math.max(this.maxObservedActive,this.activeRecords().length);
+    this.publishProgress();
   }
   private removeWaiter(waiter:Waiter){
     const i=this.queue.indexOf(waiter);
@@ -142,6 +162,7 @@ class CodeModeScheduler {
       return Promise.resolve();
     }
     record.state='queued';
+    this.publishProgress();
     const enqueuedAt=Date.now();
     return new Promise<void>((resolve,reject)=>{
       const waiter:Waiter={
@@ -157,6 +178,7 @@ class CodeModeScheduler {
         if(expired)this.expiredQueued++;else this.cancelledQueued++;
         reject(error);
         this.drain();
+        this.publishProgress();
       };
       waiter.abort=()=>fail(signal?.reason??new AgentError('CODE_MODE_CANCELLED',
         'Code Mode was cancelled while waiting for a local worker slot.'),false);
@@ -181,7 +203,7 @@ class CodeModeScheduler {
     this.workflows.set(id,record);
     this.maxObservedAdmitted=Math.max(this.maxObservedAdmitted,this.workflows.size);
     try{await this.waitForSlot(record,signal);}
-    catch(error){this.workflows.delete(id);this.drain();throw error;}
+    catch(error){this.workflows.delete(id);this.drain();this.publishProgress();throw error;}
     const activeLimitAtStart=dynamicLimit().activeLimit;
     let released=false;
     const resume=async(resumeSignal?:AbortSignal)=>{
@@ -206,7 +228,7 @@ class CodeModeScheduler {
           const hwNow=dynamicLimit();
           if(this.activeForProject(key,id)>=hwNow.perProjectActiveLimit){
             current.state='parked';current.parkReason='project-fairness';
-            this.fairnessYields++;this.parks++;this.drain();
+            this.fairnessYields++;this.parks++;this.drain();this.publishProgress();
             await resume(projectSignal);
           }
         }else if(current.state==='queued')this.drain();
@@ -216,7 +238,7 @@ class CodeModeScheduler {
         const current=this.workflows.get(id);
         if(!current||current.state!=='active')return work();
         current.state='parked';current.parkReason=reason.slice(0,120);
-        this.parks++;this.drain();
+        this.parks++;this.drain();this.publishProgress();
         try{return await work();}
         finally{await resume(parkSignal);}
       },
@@ -235,6 +257,7 @@ class CodeModeScheduler {
           this.completed++;
         }
         this.drain();
+        this.publishProgress();
       },
     };
   }

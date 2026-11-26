@@ -25,6 +25,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   const {getCallContext}=await import('../dist/context.js');
   const {operationStatus,cancelOperation}=await import('../dist/runtime/operations.js');
   const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
+  const {activity}=await import('../dist/runtime/activity.js');
   const {buildCodeModeToolDefinitions}=await import('../dist/tools/code-mode-tools.js');
   const {handleRunParallel,setJobToolExecutor}=await import('../dist/tools/jobs.js');
   const {rgPath}=await import('@vscode/ripgrep');
@@ -112,6 +113,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   await t.test('public descriptions and executable help expose parallelism/features',async()=>{
    const listing=await rpc('tools/list',{}),description=listing.tools.find(x=>x.name==='code_mode').description;
    assert.match(description,/tools.help/);assert.match(description,/tools.parallelSafe/);assert.match(description,/12 admitted \/ 8 runnable/);
+   assert.match(listing.tools.find(x=>x.name==='code_mode').inputSchema.properties.source.description,/PARALLEL FIRST/);
    const h=await tool('code_mode',{source:'const a=await tools.help("features"); const b=await tools.call("code_mode_help",{topic:"parallelism"}); return {features:a.features.map(x=>x.api),limits:b.limits};'});
    assert.equal(h.isError,false,JSON.stringify(h));
    assert.ok(h.structuredContent.result.features.some(x=>x.includes('tools.fibers')));
@@ -128,6 +130,8 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.ok(results.every(r=>!r.isError),JSON.stringify(results));
    assert.equal(peak,4,'four underlying operations actually entered the barrier together');
    assert.ok(codeModeScheduler.status().maxObservedActive>=4);
+   assert.ok(activity.recent().some(e=>e.level==='parallel'&&/CODE MODE.*active 4\//.test(e.message)),
+    'actual concurrent Code Mode workers must be visible in live counters');
    assert.equal(new Set(results.map(r=>r.structuredContent.workflowId)).size,4);
   });
   await t.test('editing help, aliases, unknown topics and tool-name help do not reject ordinary discovery',async()=>{
@@ -155,6 +159,17 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
    assert.equal(peak,2);assert.equal(arrived,3);assert.ok(finished.has('c'));
    assert.equal(result.structuredContent.result.pending,false);
+  });
+  await t.test('parallel counters update while real MCP child calls are still running',async()=>{
+   reset(99);
+   const pending=tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"read_file",args:{token:"live-a"}},{tool:"read_file",args:{token:"live-b"}},{tool:"read_file",args:{token:"live-c"}}]);return r.structuredContent;'});
+   await until(()=>arrived===3);
+   const live=activity.recent().filter(e=>e.level==='parallel').map(e=>e.message);
+   assert.ok(live.some(line=>/PARALLEL JOBS.*active 3\/3.*queued 0.*done 0\/3.*peak 3/.test(line)),live.join('\n'));
+   release();
+   const result=await pending;assert.equal(result.isError,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.result.observedPeakConcurrency,undefined,'live peak counters must not enter durable tool replies');
+   assert.ok(activity.recent().some(e=>e.level==='parallel'&&/PARALLEL JOBS.*active 0\/3.*done 3\/3.*peak 3/.test(e.message)));
   });
   await t.test('parallelSafe overlaps real blocking searches through MCP with isolated results',async()=>{
    reset(2);
@@ -220,6 +235,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    for(const file of jobFiles.filter(f=>f.endsWith('.json'))){
     const job=JSON.parse(await fs.readFile(path.join(scratch,'home','jobs',file),'utf8'));
     assert.equal(job.captureResult,undefined);assert.equal(job.parallelResult,undefined);
+    assert.equal(job.parallelProgress,undefined,'progress observers must never be persisted');
     for(const step of job.results)assert.equal(step.structuredContent,undefined,'child metadata must remain request-local');
    }
    const store=path.join(scratch,'home','harness-vnext');

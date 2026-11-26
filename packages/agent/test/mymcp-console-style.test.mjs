@@ -20,6 +20,34 @@ test('shows MyMCP remote-device received message with arguments and metadata',()
  assert.doesNotMatch(line,/paths|metadata|openai-mcp|package\.json/);
 });
 
+test('parallel receipts use lightning while ordinary calls retain the tool icon',()=>{
+ const base={timestamp:'2026-11-20T03:05:33.000Z',level:'info',id:'parallel-fixture'};
+ for(const mode of ['mymcp','compact','detailed','verbose']){
+  const line=formatActivityEvent({...base,phase:'START',tool:'run_parallel'},mode,160);
+  assert.match(line,/⚡/);assert.doesNotMatch(line,/🔧/);
+ }
+ const normal=formatActivityEvent({...base,phase:'START',tool:'read_file'},'mymcp',160);
+ assert.match(normal,/🔧 Tool call read_file/);
+ const done=formatActivityEvent({...base,phase:'OK',tool:'run_parallel'},'mymcp',160);
+ assert.match(done,/⚡ ✅ Parallel call run_parallel completed/);
+});
+
+test('live parallel counters remain visible in every console mode without changing tool totals',async()=>{
+ const log=new ActivityLog(undefined,false);
+ const resume=log.pauseConsole();
+ try{
+  log.parallel('jobs','par-fixture-abcdef',{active:2,limit:3,queued:1,completed:0,total:3,peak:2});
+  const event=log.recent().at(-1);
+  for(const mode of ['mymcp','compact','detailed','verbose']){
+   const line=formatActivityEvent(event,mode,160);
+   assert.match(line,/⚡ PARALLEL JOBS #abcdef/);
+   assert.match(line,/active 2\/3.*queued 1.*done 0\/3.*peak 2/);
+  }
+  assert.match(log.consoleQueue.join(''),/⚡ PARALLEL JOBS/);
+  assert.equal(log.status().started,0);assert.equal(log.status().finished,0);
+ }finally{log.consoleQueue.length=0;log.queuedBytes=0;resume();await log.close();}
+});
+
 test('shows MyMCP completion message with bounded JSON body',()=>{
  const trace=mymcpResultPreview('list_directory',{content:[{type:'text',
    text:'[DIR] .next\n[FILE] package.json\n[FILE] README.md'}]});

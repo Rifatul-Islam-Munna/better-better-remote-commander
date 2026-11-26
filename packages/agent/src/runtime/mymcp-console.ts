@@ -148,6 +148,10 @@ function countSummary(tool:string,result:Input,meta:Input,args:Input):string|und
     const calls=number(meta.completedCalls);
     if(calls!==undefined)return quantity(calls,'local call');
   }
+  if(tool==='run_parallel'){
+    const total=number(meta.total),finished=number(meta.finished);
+    if(total!==undefined)return (finished??0)+'/'+total+' done';
+  }
   if(tool==='start_search'||tool==='get_more_search_results'){
     const count=number(meta.totalMatches);
     if(count!==undefined)return quantity(count,'match');

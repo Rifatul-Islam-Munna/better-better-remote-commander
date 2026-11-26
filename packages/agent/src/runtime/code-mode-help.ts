@@ -2,11 +2,13 @@
 import {CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_RUNNABLE} from 'brc-shared';
 
 const parallelism = {
+  default:'Prefer parallel Code Mode for independent coding work: parallelSafe for eligible reads/searches, concurrent outer code_mode calls for independent workflows when supported by the host. Await dependencies and serialize overlapping writes.',
   safeReads:'await tools.parallelSafe([{tool:"git_status",args:{path:root}},{tool:"git_diff",args:{path:root}}],{max_concurrency:3})',
+  searches:'await tools.parallelSafe([{tool:"start_search",args:{path:root,pattern:"TODO",searchType:"content",wait:true,maxResults:20}},{tool:"start_search",args:{path:root,pattern:"test",searchType:"files",wait:true,maxResults:20}}],{max_concurrency:3})',
   commands:'Discover run_parallel for independent commands or a depends_on DAG; inspect its exact schema first.',
   workflows:'The calling AI host may submit independent code_mode requests concurrently. Each has an isolated QuickJS worker, ledger and cancellation signal. BRC never spawns another AI model.',
   limits:{maxAdmitted:CODE_MODE_MAX_ADMITTED,maxRunnable:CODE_MODE_MAX_RUNNABLE,maxRunnablePerProject:3,maxSafeReadFanout:3,adaptive:true},
-  ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts only stateless agent-verified read-only tools; it rejects mutations, search cursors and job-control tools. depends_on:[0] refers to an earlier call.',
+  ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts independent agent-verified read-only tools, including blocking start_search (omitted wait defaults to true); it rejects explicit wait:false, mutations, search cursors and job-control tools before starting any calls. depends_on:[0] refers to an earlier call.',
   safety:'Await dependent reads before edits; serialize overlapping writes. Reduce fanout under pressure. Capacity is not a target worker count.',
   completion:'Inspect response.structuredContent, pending and actual exitCode. Follow get_job/wait_jobs for pending work; never rerun completed mutations to retrieve output.',
 };
@@ -28,6 +30,7 @@ const features = [
   {api:'tools.call("spawn_job",...), tools.call("get_job",...), tools.call("wait_jobs",...)',use:'Start/follow long work; inspect actual completion. Recovery receipts do not authorize replay. Describe exact job schemas.'},
 ];
 const errors = {
+  PARALLEL_SAFE_TOOL_DENIED:'Use blocking start_search with wait:true (omitted wait defaults to true in parallelSafe). Keep cursor/job-control calls sequential; submit independent outer code_mode workflows concurrently when supported. Serialize overlapping writes. No calls in the rejected batch were started; see tools.help("parallelism").',
   CODE_MODE_NESTED_PARALLEL_DENIED:'Use parallelSafe for eligible reads, run_parallel for independent operations, or concurrent outer code_mode calls. Ordinary tools.call/specialist runs stay sequential.',
   CODE_MODE_SCRIPT_FAILED:'Inspect returned JavaScript error and exact schemas. Replies use .text / .structuredContent; do not assume arbitrary fields.',
   EDIT_MISMATCH:'Re-read exact current source/hash. Correct unique anchors and whitespace; do not relax guards.',

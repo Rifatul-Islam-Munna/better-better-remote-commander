@@ -490,6 +490,51 @@ test('tools.parallelSafe rejects mutations before executing anything',async()=>{
   assert.match(out.content[0].text,/PARALLEL_SAFE_TOOL_DENIED/);
 });
 
+test('tools.parallelSafe defaults searches to blocking without changing search options',async()=>{
+  const catalog=[
+    {name:'start_search',description:'search',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+    {name:'run_parallel',description:'parallel',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
+  ];
+  const searches=[
+    {path:project,pattern:'needle',searchType:'content',maxResults:7,literalSearch:false,includeSource:false},
+    {path:project,pattern:'*.ts',searchType:'files',wait:true,maxResults:5},
+  ];
+  const seen=[];
+  const out=await executeCodeMode(args('return await tools.parallelSafe('+JSON.stringify(searches.map(a=>({tool:'start_search',args:a})))+');',{max_calls:2}),catalog,async(name,a)=>{
+    seen.push({name,a});
+    return {content:[],structuredContent:{pending:false,total:a.calls.length}};
+  });
+  assert.notEqual(out.isError,true,JSON.stringify(out));
+  assert.equal(seen.length,1);
+  assert.equal(seen[0].name,'run_parallel');
+  assert.deepEqual(seen[0].a.calls.map(c=>c.args),searches.map(a=>({...a,wait:true})));
+  assert.equal(out.structuredContent.result.structuredContent.total,2);
+});
+
+test('tools.parallelSafe preflights the entire batch and explains denied stateful calls',async()=>{
+  const denied=[
+    {tool:'start_search',args:{path:project,pattern:'needle',wait:false}},
+    {tool:'get_more_search_results',args:{sessionId:'unused'}},
+    {tool:'stop_search',args:{sessionId:'unused'}},
+    {tool:'list_searches',args:{}},
+    {tool:'get_job',args:{id:'unused'}},
+    {tool:'write_file',args:{path:path.join(project,'never-created.txt'),content:'no'}},
+  ];
+  const catalog=[...new Set(['read_file','run_parallel',...denied.map(c=>c.tool)])].map(name=>({
+    name,description:name,inputSchema:{type:'object'},annotations:{readOnlyHint:name!=='write_file'&&name!=='run_parallel'},
+  }));
+  let invoked=0;
+  for(const call of denied){
+    const source='await tools.parallelSafe('+JSON.stringify([{tool:'read_file',args:{path:path.join(project,'package.json')}},call])+');';
+    const out=await executeCodeMode(args(source),catalog,async()=>{invoked++;return text('unexpected');});
+    assert.equal(out.isError,true,JSON.stringify(out));
+    assert.match(out.content[0].text,/PARALLEL_SAFE_TOOL_DENIED/);
+    assert.match(out.content[0].text,/No calls were started/);
+    assert.match(out.content[0].text,/outer code_mode workflows/);
+  }
+  assert.equal(invoked,0,'an invalid later entry must prevent all earlier reads from starting');
+});
+
 test('definite heavy Code Mode commands auto-escalate to durable jobs',async()=>{
   const calls=[];
   const catalog=[

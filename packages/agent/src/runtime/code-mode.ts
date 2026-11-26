@@ -56,7 +56,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'QuickJS body ending with return. Start with await tools.help(); use tools.parallelSafe for independent safe reads. Host can submit independent code_mode calls concurrently. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
+    'QuickJS body ending with return. Start with await tools.help(); default to tools.parallelSafe for independent safe reads/blocking searches, or concurrent outer code_mode calls when the host supports them. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -89,7 +89,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
   {
     name:'parallel_safe',
-    description:'Run a bounded DAG of agent-verified read-only tools concurrently inside Code Mode. The runtime rejects mutations/stateful cursor tools and adapts fanout to live machine pressure.',
+    description:'Default for independent agent-verified reads and blocking start_search calls inside Code Mode. Omitted search wait defaults to true; explicit wait:false, mutations and cursor/job-control tools are rejected before execution. Fanout adapts to live machine pressure.',
     inputSchema:{type:'object',required:['calls'],properties:{
       calls:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{
         tool:{type:'string'},args:{type:'object'},depends_on:{type:'array',items:{type:'integer',minimum:0}}
@@ -206,7 +206,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
 ];
 
 const PARALLEL_SAFE_STATEFUL_DENY=new Set([
-  'start_search','get_more_search_results','stop_search','list_searches',
+  'get_more_search_results','stop_search','list_searches',
   'get_job','wait_jobs','read_process_output','list_sessions','agent_status',
 ]);
 const MAX_TOOL_TEXT=36_000;
@@ -678,14 +678,20 @@ export async function executeCodeMode(
         const def=names.get(tool);
         if(!def||def.annotations?.readOnlyHint!==true||PARALLEL_SAFE_STATEFUL_DENY.has(tool))
           return {ok:false,error:{code:'PARALLEL_SAFE_TOOL_DENIED',
-            message:'parallelSafe only accepts stateless agent-verified read-only tools; '+(tool||'call #'+(i+1))+' is not eligible.'}};
+            message:'parallelSafe only accepts independent agent-verified read-only tools; '+(tool||'call #'+(i+1))+' is not eligible. Keep stateful calls sequential or submit independent outer code_mode workflows concurrently. No calls were started. See tools.help("parallelism").'}};
         if(!item.args||typeof item.args!=='object'||Array.isArray(item.args))
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'parallelSafe call #'+(i+1)+' requires args object.'}};
+        const args=item.args as Args;
+        // Blocking searches own their sessions and settle before returning.
+        // Never admit a streaming search or change an explicit wait:false.
+        if(tool==='start_search'&&args.wait!==undefined&&args.wait!==true)
+          return {ok:false,error:{code:'PARALLEL_SAFE_TOOL_DENIED',
+            message:'parallelSafe requires start_search with wait:true (omitted wait defaults to true here). For streaming searches use sequential tools.call or independent concurrent outer code_mode workflows. No calls were started. See tools.help("parallelism").'}};
         const deps=Array.isArray(item.depends_on)?item.depends_on:[];
         if(deps.some(x=>!Number.isInteger(x)||Number(x)<0||Number(x)>=i)||new Set(deps.map(Number)).size!==deps.length)
           return {ok:false,error:{code:'INVALID_DEPENDENCY',
             message:'parallelSafe depends_on must contain unique earlier zero-based call indices.'}};
-        safeCalls.push({tool,args:item.args,depends_on:deps.map(Number)});
+        safeCalls.push({tool,args:tool==='start_search'?{...args,wait:true}:args,depends_on:deps.map(Number)});
       }
       if(calls+safeCalls.length>input.max_calls)
         return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'parallelSafe would exceed the nested tool call budget.'}};

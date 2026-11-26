@@ -15,7 +15,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
  const hardware={availableParallelism:os.availableParallelism,totalmem:os.totalmem,freemem:os.freemem};
  os.availableParallelism=()=>24;os.totalmem=()=>64*1024**3;os.freemem=()=>48*1024**3;
  mock.timers.enable({apis:['setInterval']});
- let relay,client,configManager;
+ let relay,client,configManager,searchManager;
  let release=()=>{};
  const outstanding=[];
  try{
@@ -27,19 +27,29 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
   const {buildCodeModeToolDefinitions}=await import('../dist/tools/code-mode-tools.js');
   const {handleRunParallel,setJobToolExecutor}=await import('../dist/tools/jobs.js');
+  const {handleStartSearch}=await import('../dist/core/handlers/search-handlers.js');
+  ({searchManager}=await import('../dist/core/search-manager.js'));
   ({configManager}=await import('../dist/core/config-manager.js'));
+  const project=path.join(scratch,'project');
+  await fs.mkdir(project);
+  await fs.writeFile(path.join(project,'package.json'),'{}');
+  await fs.writeFile(path.join(project,'alpha.ts'),'export const alpha = "alphaNeedle";\n');
+  await fs.writeFile(path.join(project,'beta.ts'),'export const beta = "betaNeedle";\n');
+  await configManager.setValue('allowedDirectories',[project]);
   const catalog=[...buildCodeModeToolDefinitions(),
    {name:'read_file',description:'Synthetic barrier read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+   {name:'start_search',description:'Real blocking search behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_parallel',description:'Bounded parallel DAG',inputSchema:{type:'object'}},
    {name:'agent_status',description:'Live test status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'cancel_operation',description:'Cancel test operation',inputSchema:{type:'object'}}];
   let active=0,peak=0,target=4,arrived=0,finished=new Set();
+  const searches=[];
   let barrier;
   function reset(count){target=count;arrived=0;peak=0;finished=new Set();barrier=new Promise(r=>{release=r;});}
   reset(4);
   const executor=async(name,a)=>{
    if(name==='run_parallel')return handleRunParallel(a);
-   assert.equal(name,'read_file');
+   assert.ok(name==='read_file'||name==='start_search');
    const signal=getCallContext()?.signal;
    if(a.depends)assert.ok(finished.has(a.depends),'dependent read started before its predecessor settled');
    active++;peak=Math.max(peak,active);arrived++;
@@ -51,6 +61,12 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
      if(signal?.aborted)abort();
      barrier.then(()=>{signal?.removeEventListener('abort',abort);resolve();});
     });
+    if(name==='start_search'){
+     assert.equal(a.wait,true,'parallelSafe must not launch a streaming search');
+     const result=await handleStartSearch(a);
+     searches.push({args:a,result});
+     return result;
+    }
     finished.add(a.token);
     return {content:[{type:'text',text:'read '+a.token}]};
    }finally{active--;}
@@ -89,6 +105,10 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.equal(h.isError,false,JSON.stringify(h));
    assert.ok(h.structuredContent.result.features.some(x=>x.includes('tools.fibers')));
    assert.equal(h.structuredContent.result.limits.maxAdmitted,12);
+   const help=await tool('code_mode',{source:'return await tools.help("parallelism");'});
+   assert.match(help.structuredContent.result.default,/Prefer parallel Code Mode/);
+   assert.match(help.structuredContent.result.searches,/start_search/);
+   assert.match(help.structuredContent.result.ordering,/omitted wait defaults to true/);
   });
   await t.test('four independent Code Mode workers overlap beyond the old transport cap',async()=>{
    const calls=Array.from({length:4},(_,i)=>tool('code_mode',{source:`const r=await tools.call("read_file",{token:${i}});return r.text;`}));
@@ -107,6 +127,28 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.equal(peak,2);assert.equal(arrived,3);assert.ok(finished.has('c'));
    assert.equal(result.structuredContent.result.pending,false);
   });
+  await t.test('parallelSafe overlaps real blocking searches through MCP with isolated results',async()=>{
+   reset(2);
+   const calls=[
+    {tool:'start_search',args:{path:project,pattern:'alphaNeedle',searchType:'content',maxResults:5,includeSource:false}},
+    {tool:'start_search',args:{path:project,pattern:'betaNeedle',searchType:'content',maxResults:5,includeSource:false,wait:true}},
+   ];
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+');return r.structuredContent;'});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   assert.equal(result.structuredContent.result.total,2);
+   assert.equal(peak,2,'both search dispatches must enter the barrier together');
+   assert.equal(searches.length,2);
+   assert.equal(new Set(searches.map(s=>s.result.structuredContent.sessionId)).size,2);
+   for(const {args,result} of searches){
+    assert.notEqual(result.isError,true,JSON.stringify(result));
+    assert.equal(result.structuredContent.totalMatches,1);
+    const text=result.content.map(c=>c.text??'').join('\n');
+    assert.match(text,new RegExp(args.pattern));
+    assert.doesNotMatch(text,new RegExp(args.pattern==='alphaNeedle'?'betaNeedle':'alphaNeedle'));
+   }
+   await until(()=>searchManager.getActiveSessionCount()===0);
+  });
   await t.test('the separate Code Mode lane remains visible and cancellable',async()=>{
    reset(99);
    const pending=tool('code_mode',{source:'await tools.call("read_file",{token:"cancel"});return 1;'});
@@ -120,6 +162,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
  }finally{
   release();client?.stop();await Promise.allSettled(outstanding);
   if(relay){relay.http.closeAllConnections();await relay.close();}
+  for(const session of searchManager?.listSearchSessions()??[])searchManager.terminateSearch(session.id);
   await configManager?.close();mock.timers.reset();Object.assign(os,hardware);
   for(const key of envKeys)if(envBefore[key]===undefined)delete process.env[key];else process.env[key]=envBefore[key];
   await fs.rm(scratch,{recursive:true,force:true,maxRetries:6,retryDelay:80});

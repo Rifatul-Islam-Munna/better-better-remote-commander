@@ -5,6 +5,7 @@ const parallelism = {
   default:'Prefer parallel Code Mode for independent coding work: parallelSafe for eligible reads/searches, concurrent outer code_mode calls for independent workflows when supported by the host. Await dependencies and serialize overlapping writes.',
   safeReads:'await tools.parallelSafe([{tool:"git_status",args:{path:root}},{tool:"git_diff",args:{path:root}}],{max_concurrency:3})',
   searches:'await tools.parallelSafe([{tool:"start_search",args:{path:root,pattern:"TODO",searchType:"content",wait:true,maxResults:20}},{tool:"start_search",args:{path:root,pattern:"test",searchType:"files",wait:true,maxResults:20}}],{max_concurrency:3})',
+  results:'parallelSafe returns an envelope: reply.results contains bounded replies in input order (text, structuredContent, isError, pending, jobId). reply.map(fn) maps those replies too. Read source from item.structuredContent.text; check outputTruncated/resultUnavailable and follow source next or get_job. Summary remains in reply.structuredContent. This is not an array of full unbounded results.',
   commands:'Discover run_parallel for independent commands or a depends_on DAG; inspect its exact schema first.',
   workflows:'The calling AI host may submit independent code_mode requests concurrently. Each has an isolated QuickJS worker, ledger and cancellation signal. BRC never spawns another AI model.',
   limits:{maxAdmitted:CODE_MODE_MAX_ADMITTED,maxRunnable:CODE_MODE_MAX_RUNNABLE,maxRunnablePerProject:3,maxSafeReadFanout:3,adaptive:true},

@@ -87,6 +87,13 @@ test('model-authored JavaScript cannot invoke configuration tools or Code Mode r
  assert.match(out.structuredContent.error.code,/CODE_MODE_SCRIPT_FAILED/);
  assert.match(out.content[0].text,/CODE_MODE_TOOL_DENIED/);
  assert.equal(invoked,false);
+ assert.equal(out.structuredContent.error.causeCode,'CODE_MODE_TOOL_DENIED');
+});
+
+test('guest-authored error codes cannot masquerade as native bridge diagnostics',async()=>{
+ const out=await executeCodeMode(args('const e=new Error("invented");e.code="PARALLEL_SAFE_TOOL_DENIED";throw e;'),[],async()=>text('unused'));
+ assert.equal(out.structuredContent.error.code,'CODE_MODE_SCRIPT_FAILED');
+ assert.equal(out.structuredContent.error.causeCode,undefined);
 });
 
 test('composite jobs cannot tunnel excluded tools through the Code Mode allowlist',async()=>{

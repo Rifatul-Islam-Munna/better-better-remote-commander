@@ -1,6 +1,7 @@
 /** Each async tool chain has its own client identity, deadline and cancellation signal. */
 import { AsyncLocalStorage } from 'node:async_hooks';
-export interface CallContext { id: string; client: { name?: string; version?: string } | null; remote: boolean; signal?: AbortSignal; deadline?: number; depth?: number; writePrecondition?: { path: string; sha256: string }; specialist?: { role: string; specialty?: string; routing: 'AUTO' | 'EXPLICIT' } }
+import type {ToolResult} from 'brc-shared';
+export interface CallContext { id: string; client: { name?: string; version?: string } | null; remote: boolean; signal?: AbortSignal; deadline?: number; depth?: number; writePrecondition?: { path: string; sha256: string }; specialist?: { role: string; specialty?: string; routing: 'AUTO' | 'EXPLICIT' }; parallelResult?: (index:number,result:ToolResult)=>void }
 const calls = new AsyncLocalStorage<CallContext>();
 export let currentClient = { name: 'brc-agent', version: '0.0.0' };
 export function setCurrentClient(info: { name?: string; version?: string }): void { currentClient = { name: info.name ?? 'unknown', version: info.version ?? 'unknown' }; }

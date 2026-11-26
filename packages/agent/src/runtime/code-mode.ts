@@ -340,6 +340,9 @@ export async function executeCodeMode(
   let closed=false;
   let calls=0;
   let discoveries=0;
+  // Only parent-issued bridge errors may supply a diagnostic cause code.
+  // Bounded and workflow-local; guest-authored error.code is never trusted.
+  const bridgeFailures=new Map<string,string>();
   let activeProjectSessionId:string|undefined;
   const projectObservations:Array<{tool:string;args:Args;meta:Record<string,unknown>}>=[];
   const touchedPaths=new Set<string>();
@@ -434,7 +437,8 @@ export async function executeCodeMode(
   };
   await checkpointRecovery('running').catch(()=>undefined);
 
-  const runToolCall=async(name:string,args:Args,role?:string,specialty?:string):Promise<RpcReply>=>{
+  const runToolCall=async(name:string,args:Args,role?:string,specialty?:string,
+    parallelResult?: (index:number,result:ToolResult)=>void):Promise<RpcReply>=>{
     if(!names.has(name))
       return {ok:false,error:{code:'CODE_MODE_TOOL_DENIED',message:'Tool not permitted in Code Mode. Use tools.search for available tools.'}};
     if(++calls>input.max_calls)
@@ -478,8 +482,11 @@ export async function executeCodeMode(
     if(prepared.mustStop)return prepared.mustStop;
     if(prepared.replay){
       const reply=prepared.replay as RpcReply;
-      const replayError=reply.ok?undefined:reply.error?.code;
-      steps.push({tool:name,outcome:reply.ok?'ok':'error',durationMs:0,
+      const replayMeta=(reply.value as {structuredContent?:Record<string,unknown>}|undefined)?.structuredContent;
+      const replayError=reply.ok
+        ?name==='run_parallel'&&typeof replayMeta?.failed==='number'&&replayMeta.failed>0?'PARALLEL_CALL_FAILED':undefined
+        :reply.error?.code;
+      steps.push({tool:name,outcome:replayError?'error':'ok',durationMs:0,
         ...(replayError?{errorCode:replayError}:{}),replayed:true,attempts:0,
         ...(effectiveRole?{role:effectiveRole}:{}),...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
         ...(autoSpecialist?{autoSpecialist:true}:{})});
@@ -521,9 +528,10 @@ export async function executeCodeMode(
         detail:{reason:escalation.reason,label:escalation.label,projectKey}});
       const effectiveName=escalation?'spawn_job':name;
       const effectiveArgs=escalation?escalation.spawnArgs:lifecycle.args;
-      const rawInvoke=(signal:AbortSignal)=>parent
-        ?withCallContext({...parent,id:execution.id+':'+prepared.index,signal,
-          depth:(parent.depth??0)+1,
+      const rawInvoke=(signal:AbortSignal)=>parent||parallelResult
+        ?withCallContext({...parent,client:parent?.client??null,remote:parent?.remote??false,
+          id:execution.id+':'+prepared.index,signal,parallelResult,
+          depth:(parent?.depth??0)+1,
           specialist:effectiveRole?{
             role:effectiveRole,
             ...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
@@ -586,9 +594,10 @@ export async function executeCodeMode(
       }
       const pending=meta.pending===true;
       const error=meta.error as {code?:unknown}|undefined;
-      const code=typeof error?.code==='string'?error.code:'TOOL_FAILED';
+      const nestedFailed=name==='run_parallel'&&typeof meta.failed==='number'&&meta.failed>0;
+      const code=typeof error?.code==='string'?error.code:nestedFailed?'PARALLEL_CALL_FAILED':'TOOL_FAILED';
       const jobId=typeof meta.jobId==='string'?meta.jobId:undefined;
-      const status=response.isError?'error':pending?'pending':'ok';
+      const status=response.isError||nestedFailed?'error':pending?'pending':'ok';
       const {value,truncated,handle}=await toolReply(response,name);
       if(handle){
         continuationHandles.set(handle.id,handle);
@@ -606,13 +615,15 @@ export async function executeCodeMode(
         :{ok:true,value};
       await durableSettleStep(execution,prepared.index,reply,attempts,trace);
       steps.push({tool:name,outcome:status,durationMs:Date.now()-stepStart,
-        ...(response.isError?{errorCode:code}:{}),...(jobId?{jobId}:{}),
+        ...(response.isError||nestedFailed?{errorCode:code}:{}),...(jobId?{jobId}:{}),
         ...(truncated?{outputTruncated:true}:{}),attempts,...(coalesced?{coalesced:true}:{}),
         ...(parked?{parked:true}:{}),...(projectKey?{projectKey}:{}),
         ...(autoEscalated?{autoEscalated:true,escalationReason}:{}),
         ...(effectiveRole?{role:effectiveRole}:{}),...(effectiveSpecialty?{specialty:effectiveSpecialty}:{}),
         ...(autoSpecialist?{autoSpecialist:true}:{})});
       if(pending&&jobId)pendingJobs.push(jobId);
+      if(pending&&Array.isArray(meta.jobIds))for(const id of meta.jobIds)
+        if(typeof id==='string'&&!pendingJobs.includes(id))pendingJobs.push(id);
       if(activeProjectSessionId&&projectObservations.length<64)
         projectObservations.push({tool:name,args:lifecycle.args,meta});
       await checkpointRecovery(pending?'pending':'running').catch(()=>undefined);
@@ -709,17 +720,50 @@ export async function executeCodeMode(
       const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):3;
       const adaptive=adaptiveTaskConcurrency(safeCalls,requested);
       const maxConcurrency=adaptive.effective;
+      // Deliver ordered child replies in RAM, after the normal dispatcher has
+      // executed them. Keep the aggregate extra payload below 24k characters.
+      const results:Array<Record<string,unknown>|null>=safeCalls.map(()=>null);
+      const resultBudget=Math.floor(24_000/safeCalls.length);
+      const capture=(index:number,result:ToolResult)=>{
+        const tool=String(safeCalls[index].tool);
+        const metadataCompacted=limited(result.structuredContent,resultBudget/2+1).length>resultBudget/2;
+        const structuredContent=metadataCompacted
+          ?compactStructured(result.structuredContent,tool,Math.max(200,resultBudget-1000)):result.structuredContent;
+        const text=typeof structuredContent?.text==='string'?'':
+          result.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
+        const value={text:text.slice(0,Math.floor(resultBudget/2)),isError:!!result.isError,
+          pending:result.structuredContent?.pending===true,structuredContent,
+          mediaOmitted:result.content.some(c=>c.type!=='text'),
+          ...(metadataCompacted||text.length>Math.floor(resultBudget/2)||structuredContent?.outputTruncated===true?{outputTruncated:true}:{})};
+        results[index]=limited(value,resultBudget+1).length<=resultBudget?value:{
+          text:'Result exceeds the per-call budget. Inspect the job output or request a narrower read before deriving edits.',
+          isError:!!result.isError,pending:result.structuredContent?.pending===true,outputTruncated:true,
+        };
+      };
       const reply=await runToolCall('run_parallel',{
         calls:safeCalls,max_concurrency:maxConcurrency,
         timeout_ms:typeof a.timeout_ms==='number'?a.timeout_ms:Math.min(90_000,input.max_runtime_ms),
         output_chars:typeof a.output_chars==='number'?a.output_chars:4_000,
         retain_output:true,
-      });
+      },undefined,undefined,capture);
+      let parallelReply=reply;
+      if(reply.ok&&reply.value&&typeof reply.value==='object'){
+        const value=reply.value as Record<string,unknown>;
+        const meta=value.structuredContent as Record<string,unknown>|undefined;
+        const ids=Array.isArray(meta?.jobIds)?meta.jobIds:[];
+        const projectedResults=results.map((result,index)=>({...result,
+          index,tool:safeCalls[index].tool,
+          ...(result===null?{resultUnavailable:true,pending:meta?.pending===true}:{}),
+          ...(typeof ids[index]==='string'?{jobId:ids[index],next:{tool:'get_job',args:{id:ids[index]}}}:{}),
+        }));
+        // Do not mutate the reply referenced by the durable step ledger.
+        parallelReply={...reply,value:{...value,results:projectedResults}};
+      }
       if(reply.ok)for(const call of safeCalls)
         await sourceLedger.recordRead(String(call.tool),call.args as Record<string,unknown>).catch(()=>undefined);
       await trace.event('parallel_safe',{detail:{calls:safeCalls.length,maxConcurrency,
         workloadClasses:adaptive.classes,pressure:adaptive.pressure,ok:reply.ok}});
-      return reply;
+      return parallelReply;
     }
     if(request.type==='semantic'){
       if(request.name!=='search'||!request.args||typeof request.args!=='object'||Array.isArray(request.args))
@@ -1173,6 +1217,11 @@ export async function executeCodeMode(
         if(settled)return;
         if(message?.type==='rpc'){
           void handleRpc(message.request).then(reply=>{
+            if(!reply.ok&&reply.error){
+              const key=(reply.error.code+': '+reply.error.message).slice(0,900);
+              bridgeFailures.delete(key);bridgeFailures.set(key,reply.error.code);
+              if(bridgeFailures.size>16)bridgeFailures.delete(bridgeFailures.keys().next().value!);
+            }
             if(!settled)worker?.postMessage({type:'reply',id:message.id,reply});
           }).catch(error=>{
             if(!settled)worker?.postMessage({type:'reply',id:message.id,reply:{
@@ -1208,6 +1257,13 @@ export async function executeCodeMode(
           }
           const out=failureWithSteps('CODE_MODE_SCRIPT_FAILED',message.message.slice(0,900));
           out.structuredContent={...out.structuredContent,executionId:execution.id,traceId:trace.record.id,resumed};
+          const causeCode=bridgeFailures.get(message.message.slice(0,900));
+          if(causeCode){
+            const original=out.structuredContent.error as Record<string,unknown>;
+            const guidance=failure(new AgentError(causeCode,message.message.slice(0,900))).structuredContent?.recovery;
+            out.structuredContent.error={...original,causeCode};
+            if(guidance)out.structuredContent.recovery=guidance;
+          }
           finishPersisted('failed',out,{message:message.message.slice(0,900)});
           return;
         }

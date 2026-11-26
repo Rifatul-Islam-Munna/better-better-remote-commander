@@ -17,6 +17,9 @@ let scheduled=false;
 
 const explanations:Record<string,string>={
   CODE_MODE_SCRIPT_FAILED:'guest JavaScript failed; inspect the returned script error and tools.help("errors"); verify exact tool schemas and response.structuredContent fields',
+  PARALLEL_SAFE_TOOL_DENIED:'parallelSafe rejected an ineligible call; use blocking start_search with wait:true, keep cursors sequential, or use independent outer code_mode workflows',
+  CODE_MODE_TOOL_DENIED:'tool is not available in Code Mode; discover the permitted tool schema first',
+  CODE_MODE_CALL_LIMIT:'workflow exceeded its nested tool-call budget; split the work or request a supported max_calls limit',
   CODE_MODE_NESTED_PARALLEL_DENIED:'ordinary nested calls overlap; use tools.parallelSafe for eligible reads, run_parallel for commands or concurrent outer code_mode workflows',
   CODE_MODE_OUTPUT_LIMIT:'guest output exceeded its bounded result budget; use local result handles/pages and return a compact summary',
   CODE_MODE_UNAWAITED_CALLS:'guest returned with pending local calls; await every operation or an approved parallel helper before returning',

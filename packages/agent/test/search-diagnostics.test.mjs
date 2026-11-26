@@ -101,6 +101,20 @@ test('failed run_command records safe diagnosis and exit code, never the shell c
  assert.ok(!(await fs.readFile(failureLogPath(),'utf8')).includes(command));
 });
 
+test('native Code Mode rejections retain their safe cause in diagnostics without guest source',async()=>{
+ const secret='private_guest_source_'+Date.now();
+ const source='/* '+secret+' */ await tools.parallelSafe([{tool:"start_search",args:{path:'+JSON.stringify(root)+',pattern:"needle",wait:false}}]);';
+ const out=await callTool('code_mode',{source});
+ assert.equal(out.structuredContent.error.code,'CODE_MODE_SCRIPT_FAILED');
+ assert.equal(out.structuredContent.error.causeCode,'PARALLEL_SAFE_TOOL_DENIED');
+ await flushToolFailureLogs();
+ const body=await fs.readFile(failureLogPath(),'utf8');
+ const last=JSON.parse(body.trim().split('\n').at(-1));
+ assert.equal(last.tool,'code_mode');assert.equal(last.code,'PARALLEL_SAFE_TOOL_DENIED');
+ assert.match(last.reason,/blocking start_search/);
+ assert.ok(!body.includes(secret));
+});
+
 test('failure logger retains metadata only, is bounded, and can be disabled',async()=>{
  const {recordToolFailure,flushToolFailureLogs}=await import('../dist/runtime/failure-log.js');
  const enabled=process.env.BRC_ERROR_LOG;

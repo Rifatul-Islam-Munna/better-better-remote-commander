@@ -28,6 +28,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   const {buildCodeModeToolDefinitions}=await import('../dist/tools/code-mode-tools.js');
   const {handleRunParallel,setJobToolExecutor}=await import('../dist/tools/jobs.js');
   const {handleStartSearch}=await import('../dist/core/handlers/search-handlers.js');
+  const {CODING_TOOL_HANDLERS}=await import('../dist/tools/coding-tools.js');
   ({searchManager}=await import('../dist/core/search-manager.js'));
   ({configManager}=await import('../dist/core/config-manager.js'));
   const project=path.join(scratch,'project');
@@ -38,6 +39,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   await configManager.setValue('allowedDirectories',[project]);
   const catalog=[...buildCodeModeToolDefinitions(),
    {name:'read_file',description:'Synthetic barrier read',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+   {name:'read_code_file',description:'Real source read behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'start_search',description:'Real blocking search behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_parallel',description:'Bounded parallel DAG',inputSchema:{type:'object'}},
    {name:'agent_status',description:'Live test status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
@@ -49,7 +51,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   reset(4);
   const executor=async(name,a)=>{
    if(name==='run_parallel')return handleRunParallel(a);
-   assert.ok(name==='read_file'||name==='start_search');
+   assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file');
    const signal=getCallContext()?.signal;
    if(a.depends)assert.ok(finished.has(a.depends),'dependent read started before its predecessor settled');
    active++;peak=Math.max(peak,active);arrived++;
@@ -67,6 +69,8 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
      searches.push({args:a,result});
      return result;
     }
+    if(name==='read_code_file')return CODING_TOOL_HANDLERS.read_code_file(a);
+    if(a.fail)return {isError:true,content:[{type:'text',text:'READ_FAILED'}],structuredContent:{error:{code:'READ_FAILED'}}};
     finished.add(a.token);
     return {content:[{type:'text',text:'read '+a.token}]};
    }finally{active--;}
@@ -133,10 +137,11 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
     {tool:'start_search',args:{path:project,pattern:'alphaNeedle',searchType:'content',maxResults:5,includeSource:false}},
     {tool:'start_search',args:{path:project,pattern:'betaNeedle',searchType:'content',maxResults:5,includeSource:false,wait:true}},
    ];
-   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+');return r.structuredContent;'});
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+');return {...r.structuredContent,counts:r.results.map(v=>v.structuredContent.totalMatches)};'});
    assert.equal(result.isError,false,JSON.stringify(result));
    assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
    assert.equal(result.structuredContent.result.total,2);
+   assert.deepEqual(result.structuredContent.result.counts,[1,1]);
    assert.equal(peak,2,'both search dispatches must enter the barrier together');
    assert.equal(searches.length,2);
    assert.equal(new Set(searches.map(s=>s.result.structuredContent.sessionId)).size,2);
@@ -148,6 +153,62 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
     assert.doesNotMatch(text,new RegExp(args.pattern==='alphaNeedle'?'betaNeedle':'alphaNeedle'));
    }
    await until(()=>searchManager.getActiveSessionCount()===0);
+  });
+  await t.test('parallelSafe exposes ordered native replies and supports the logged map pattern',async()=>{
+   reset(2);
+   const files=['alpha.ts','beta.ts'];
+   const source='const files='+JSON.stringify(files.map(f=>path.join(project,f)))+';'+
+    'const r=await tools.parallelSafe(files.map(path=>({tool:"read_code_file",args:{path}})));'+
+    'return {summary:r.structuredContent.total,items:r.map((v,i)=>({i,index:v.index,text:v.structuredContent.text,sha:v.structuredContent.sha256})),count:r.results.length};';
+   const result=await tool('code_mode',{source});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   const value=result.structuredContent.result;
+   assert.equal(value.summary,2);assert.equal(value.count,2);assert.equal(peak,2);
+   for(const [i,item]of value.items.entries()){
+    assert.equal(item.index,i);assert.equal(item.i,i);
+    assert.equal(item.text,await fs.readFile(path.join(project,files[i]),'utf8'));
+    assert.match(item.sha,/^[a-f0-9]{64}$/);
+   }
+   const jobFiles=await fs.readdir(path.join(scratch,'home','jobs'));
+   for(const file of jobFiles.filter(f=>f.endsWith('.json'))){
+    const job=JSON.parse(await fs.readFile(path.join(scratch,'home','jobs',file),'utf8'));
+    assert.equal(job.captureResult,undefined);assert.equal(job.parallelResult,undefined);
+    for(const step of job.results)assert.equal(step.structuredContent,undefined,'child metadata must remain request-local');
+   }
+   const store=path.join(scratch,'home','harness-vnext');
+   for(const file of (await fs.readdir(store)).filter(f=>f.startsWith('execution--')&&f.endsWith('.json'))){
+    const execution=JSON.parse(await fs.readFile(path.join(store,file),'utf8'));
+    for(const step of execution.steps.filter(s=>s.tool==='run_parallel'))
+     assert.equal(step.reply?.value?.results,undefined,'projected child results must not enter the durable ledger');
+   }
+  });
+  await t.test('parallelSafe bounds source replies and retains exact continuation metadata',async()=>{
+   reset(1);
+   const file=path.join(project,'large.ts');
+   const expected='x'.repeat(40000);await fs.writeFile(file,expected);
+   const source='const r=await tools.parallelSafe([{tool:"read_code_file",args:{path:'+JSON.stringify(file)+',charLength:50000,maxChars:50000}}]);const v=r.results[0];return {truncated:v.outputTruncated,chars:JSON.stringify(v).length,textChars:v.structuredContent.text.length,allX:/^x+$/.test(v.structuredContent.text),next:v.structuredContent.next.args.charOffset};';
+   const result=await tool('code_mode',{source});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   const value=result.structuredContent.result;
+   assert.equal(value.truncated,true);assert.equal(value.allX,true);
+   assert.ok(value.chars<25000);assert.equal(value.next,value.textChars);
+  });
+  await t.test('parallelSafe reports pending jobs without waiting for late result capture',async()=>{
+   reset(99);
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"read_file",args:{token:"late"}}],{timeout_ms:1000});return r.results[0];'});
+   assert.equal(result.structuredContent.pending,true,JSON.stringify(result));
+   const value=result.structuredContent.result;
+   assert.equal(value.pending,true);assert.equal(value.resultUnavailable,true);
+   assert.ok(result.structuredContent.pendingJobs.includes(value.jobId));
+   release();await until(()=>active===0);
+  });
+  await t.test('parallelSafe never labels failed child reads as all calls succeeded',async()=>{
+   reset(1);
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"read_file",args:{fail:true}}]);return r.results[0];'});
+   assert.equal(result.structuredContent.allCallsSucceeded,false,JSON.stringify(result));
+   assert.equal(result.structuredContent.status,'completed_with_step_errors');
+   assert.equal(result.structuredContent.result.isError,true);
+   assert.equal(result.structuredContent.result.structuredContent.error.code,'READ_FAILED');
   });
   await t.test('the separate Code Mode lane remains visible and cancellable',async()=>{
    reset(99);

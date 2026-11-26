@@ -31,6 +31,7 @@ import { getCallContext, withCallContext, type CallContext } from '../context.js
 import type { CommandProgress } from './brc-tools.js';
 import { homeDir } from '../transport/pairing.js';
 import type { ServerResult } from '../core/types.js';
+import type {ToolResult} from 'brc-shared';
 import type { ToolDefinition } from '../core/tool-definitions.js';
 import { isHeavyTool } from '../runtime/operations.js';
 import { saveJobOutput,readJobOutput,redactJobOutput,spillEnabled,type SpillRef } from '../runtime/job-output-spill.js';
@@ -260,6 +261,8 @@ interface Job {
   // runtime only
   quickReturnPending?: boolean;
   quickResult?: ServerResult;
+  /** Request-local result delivery only; never persisted or retained after a parallel wait. */
+  captureResult?: (result:ServerResult)=>void;
   consoleOutcome?: CommandActivityResult;
   consoleTrace?: string;
   progress?: CommandProgress;
@@ -401,6 +404,7 @@ async function runJob(job: Job): Promise<void> {
         res = text(`Error: ${e instanceof Error ? e.message : String(e)}`, true);
       }
       if (job.quickReturnPending) job.quickResult = res;
+      try{job.captureResult?.(res);}catch{/* Result projection must not change execution. */}
       if (job.label === 'run_command') {
         job.consoleOutcome = summarizeCommandActivity(res);
         job.consoleTrace = activity.getConsoleMode()==='verbose' ? traceToolResult('run_command',res) : undefined;
@@ -587,7 +591,7 @@ function cancel(job: Job): boolean {
 // Persistence (best effort)
 // ---------------------------------------------------------------------------
 function serialisable(job: Job) {
-  const { abort, done, resolveDone, cancelRequested, timedOut, quickReturnPending, quickResult,
+  const { abort, done, resolveDone, cancelRequested, timedOut, quickReturnPending, quickResult, captureResult,
     progress, consoleOutcome, consoleTrace, ownerClient, ownerRemote, ...rest } = job;
   // Completed/interrupted jobs are never replayed from disk. Do not persist
   // arbitrary shell strings, plugin args, edit text, or secrets in job history.
@@ -1016,6 +1020,8 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
     groupConcurrency: adaptive.effective,
     retainOutput:a.retain_output,
   }));
+  const capture=getCallContext()?.parallelResult;
+  if(capture)for(const [index,job]of batch.entries())job.captureResult=result=>capture(index,result as ToolResult);
   // Resolve dependency IDs after all jobs exist; indices were validated above.
   for(let i=0;i<batch.length;i++)
     batch[i].dependsOn=a.calls[i].depends_on.map(index=>batch[index].id);
@@ -1028,7 +1034,8 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
   // job at a time, and lightweight work can pass a queued heavy job.
   for (const job of batch) enqueue(job);
 
-  await waitUntil(batch, () => batch.every(isFinished), a.timeout_ms);
+  try{await waitUntil(batch, () => batch.every(isFinished), a.timeout_ms);}
+  finally{for(const job of batch)delete job.captureResult;}
 
   const finished = batch.filter(isFinished);
   const failed = finished.filter((j) => j.status !== 'succeeded');

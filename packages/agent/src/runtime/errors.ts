@@ -35,6 +35,7 @@ export function failure(err: unknown, callId?: string): ToolResult {
     MOVE_DIRECTORY_EXDEV:'Cross-volume directory move was stopped without copying/deleting the directory. Use an approved recursive verified-copy workflow for folder trees.',
     CODE_MODE_NESTED_PARALLEL_DENIED:'Use tools.parallelSafe for independent safe reads, run_parallel for independent commands, or concurrent outer code_mode workflows. Ordinary tools.call and specialist runs stay sequential. See tools.help("parallelism").',
     CODE_MODE_SCRIPT_FAILED:'Inspect the script error and exact tool schemas. Use tools.help("errors") for response shapes, quoting and recovery; never replay uncertain mutations.',
+    PARALLEL_SAFE_TOOL_DENIED:'Use start_search with wait:true in parallelSafe. Keep streaming/cursor/job-control calls sequential, or submit independent outer code_mode workflows concurrently. See tools.help("parallelism").',
     EDIT_MISMATCH:'Re-read the current source and SHA-256; correct exact unique anchors and whitespace before resubmitting.',
     BUSY:'The agent queue is full. Wait briefly, retry the read-only operation once; for writes inspect state before retrying.',
     WORKER_CAPACITY:'All worker slots are busy. Submit, release or renew a claim; do not create a competing plan.',

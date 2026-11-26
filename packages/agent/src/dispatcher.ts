@@ -379,7 +379,9 @@ export async function callTool(name: string, args: Args): Promise<ToolResult> {
   out=compactDuplicatedToolText(out);
   trackExecutionOutcome(classifyExecution(out,kind));
   const durationMs=Math.round(performance.now()-start);
-  const error=out.structuredContent?.error as {code?:string}|undefined;
+  const returnedError=out.structuredContent?.error as {code?:string;causeCode?:string}|undefined;
+  const error=name==='code_mode'&&returnedError?.code==='CODE_MODE_SCRIPT_FAILED'&&returnedError.causeCode
+    ?{...returnedError,code:returnedError.causeCode}:returnedError;
   const repeated=repeatFailureGuard.observe(name,args,!!out.isError,error?.code);
   if(repeated){
     // Advisory only: keep the original error and never execute a retry.

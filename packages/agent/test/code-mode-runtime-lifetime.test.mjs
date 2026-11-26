@@ -1,6 +1,13 @@
-import {test} from 'node:test';
+import {test,after} from 'node:test';
 import assert from 'node:assert/strict';
-import {executeCodeMode} from '../dist/runtime/code-mode.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const scratch=await fs.mkdtemp(path.join(os.tmpdir(),'brc-code-mode-lifetime-'));
+process.env.BRC_HOME=scratch;
+const {executeCodeMode}=await import('../dist/runtime/code-mode.js');
+const {configManager}=await import('../dist/core/config-manager.js');
+after(async()=>{await configManager.close();await fs.rm(scratch,{recursive:true,force:true,maxRetries:8,retryDelay:80});});
 
 const catalog=[{
   name:'read_file',

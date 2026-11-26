@@ -101,18 +101,20 @@ test('run_parallel serializes heavy commands and keeps input order', async () =>
   assert.match(text, /=== bad -> FAILED/);
 });
 
-test('lightweight reads finish while a long heavy background command is still running', async () => {
+test('lightweight reads overlap a long command when pressure permits, with serial fallback under pressure', async () => {
   const r = await callTool('run_parallel', { timeout_ms: 1200, max_concurrency: 3, calls: [
     { command: sleepCmd(4000, 'heavy-finished'), label: 'heavy' },
     { tool: 'read_file', args: { path: path.join(repo, 'package.json'), length: 2 }, label: 'quick-read' },
   ] });
   const text = out(r);
-  assert.match(text, /run_parallel: 1\/2 done/);
+  const serial=r.structuredContent.effectiveConcurrency===1;
+  assert.match(text,serial?/run_parallel: 0\/2 done/:/run_parallel: 1\/2 done/);
   assert.equal(r.structuredContent.pending,true);
   assert.equal(r.structuredContent.executionCompleted,false);
   assert.equal(r.structuredContent.allCallsSucceeded,false);
   assert.match(text, /=== heavy -> STILL RUNNING/);
-  assert.match(text, /=== quick-read -> OK/);
+  assert.match(text,serial?/=== quick-read -> STILL QUEUED/:/=== quick-read -> OK/);
+  if(serial)assert.match(r.structuredContent.pressure,/high|critical/);
   const group = text.match(/wait_jobs\(\{"group":"(par-[a-z0-9]+)"\}\)/)?.[1];
   assert.ok(group, text);
   const finished = await callTool('wait_jobs', { group, timeout_ms: 10_000 });

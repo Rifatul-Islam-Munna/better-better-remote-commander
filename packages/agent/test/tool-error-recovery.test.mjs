@@ -46,6 +46,10 @@ test('invalid interact_with_process arguments produce a structured error without
 
 test('failure-only diagnostic mapping provides actionable reasons without tool arguments',()=>{
  for(const [tool,code] of [
+   ['code_mode','CODE_MODE_SCRIPT_FAILED'],
+   ['code_mode','CODE_MODE_NESTED_PARALLEL_DENIED'],
+   ['edit_files','EDIT_MISMATCH'],
+   ['apply_patch','PATCH_SYNTAX'],
    ['read_code_file','CODE_SNAPSHOT_FAILED'],
    ['list_directory','DIRECTORY_LIST_FAILED'],
    ['project_map','PROJECT_MAP_FAILED'],

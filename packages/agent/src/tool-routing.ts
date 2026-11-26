@@ -8,6 +8,8 @@
  *
  * Keep coverage exact when tools are added or removed (see tests).
  */
+import {CODE_MODE_TOOL_CHOICE,CODE_MODE_DISCOVERY_DESCRIPTION} from 'brc-shared';
+
 export interface ToolChoice {
   use: string;
   instead: string;
@@ -16,11 +18,7 @@ export interface ToolChoice {
 
 /** Keep each tool's recommendation concise; detailed parameters live in JSON Schema. */
 export const TOOL_CHOICES: Record<string, ToolChoice> = {
-  code_mode: {
-    use: 'PRIMARY DEFAULT for multi-step work. Independent workstreams MUST use tools.agent.run/specialist; otherwise complex/multi-domain calls auto-route.',
-    instead: 'Use direct tools only for one simple action or unavailable/unsupported Code Mode; large or truncated Code Mode output is NOT a fallback signal.',
-    caveat: 'Specialists are local permission scopes, not extra LLMs. Stay in Code Mode for continuations; never replay uncertain mutations.',
-  },
+  code_mode: CODE_MODE_TOOL_CHOICE,
   get_config: {
     use: 'Inspect this BRC agent configuration and access limits.',
     instead: 'For project coding conventions use project_context or project_preferences; for process health use agent_status.',
@@ -447,6 +445,9 @@ export const MAX_DISCOVERY_DESCRIPTION_CHARS=870;
 export function addToolChoice<T extends { name: string; description: string }>(tool: T): T {
   const rule = TOOL_CHOICES[tool.name];
   if (!rule) throw new Error('Missing MCP tool choice rule for ' + tool.name);
+  // The primary execution surface needs its complete, shared onboarding.
+  // Never hide parallelism/features behind the generic 870-character clip.
+  if(tool.name==='code_mode')return {...tool,description:CODE_MODE_DISCOVERY_DESCRIPTION};
   const guide = 'USE WHEN: ' + rule.use +
     '\nUSE INSTEAD: ' + rule.instead +
     (rule.caveat ? '\nIMPORTANT: ' + rule.caveat : '') +

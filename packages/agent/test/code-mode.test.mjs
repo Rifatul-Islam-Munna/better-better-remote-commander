@@ -1,7 +1,14 @@
-import {test} from 'node:test';
+import {test,after} from 'node:test';
 import assert from 'node:assert/strict';
-import {executeCodeMode,CODE_MODE_ALLOWED_TOOLS} from '../dist/runtime/code-mode.js';
-import {listTools} from '../dist/dispatcher.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+const scratch=await fs.mkdtemp(path.join(os.tmpdir(),'brc-code-mode-'));
+process.env.BRC_HOME=scratch;
+const {executeCodeMode,CODE_MODE_ALLOWED_TOOLS}=await import('../dist/runtime/code-mode.js');
+const {listTools}=await import('../dist/dispatcher.js');
+const {configManager}=await import('../dist/core/config-manager.js');
+after(async()=>{await configManager.close();await fs.rm(scratch,{recursive:true,force:true,maxRetries:8,retryDelay:80});});
 
 const catalog=[
   {name:'read_file',description:'Read one known project file',inputSchema:{type:'object',properties:{path:{type:'string'}}}},

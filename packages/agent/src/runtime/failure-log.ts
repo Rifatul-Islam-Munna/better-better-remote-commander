@@ -16,6 +16,13 @@ let queued:Failure[]=[];
 let scheduled=false;
 
 const explanations:Record<string,string>={
+  CODE_MODE_SCRIPT_FAILED:'guest JavaScript failed; inspect the returned script error and tools.help("errors"); verify exact tool schemas and response.structuredContent fields',
+  CODE_MODE_NESTED_PARALLEL_DENIED:'ordinary nested calls overlap; use tools.parallelSafe for eligible reads, run_parallel for commands or concurrent outer code_mode workflows',
+  CODE_MODE_OUTPUT_LIMIT:'guest output exceeded its bounded result budget; use local result handles/pages and return a compact summary',
+  CODE_MODE_UNAWAITED_CALLS:'guest returned with pending local calls; await every operation or an approved parallel helper before returning',
+  EDIT_MISMATCH:'exact edit anchors did not match current source; re-read source/hash and correct unique context and whitespace',
+  PATCH_SYNTAX:'patch grammar is invalid; describe apply_patch and use exact directives without Markdown fences',
+  PATCH_CONTEXT_MISMATCH:'patch context did not uniquely match current source; re-read affected lines and use exact unique context',
   SEARCH_INVALID_PATTERN:'ripgrep rejected the regex; correct it or set literalSearch=true',
   SEARCH_INVALID_GLOB:'ripgrep rejected the filename glob; correct the wildcard syntax',
   SEARCH_RIPGREP_UNAVAILABLE:'ripgrep executable unavailable; install rg or configure BRC_RG_PATH',

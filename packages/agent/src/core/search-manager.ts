@@ -74,7 +74,7 @@ export interface SearchSessionOptions {
   timeout?: number;
   earlyTermination?: boolean;  // Stop search early when exact filename match is found
   literalSearch?: boolean;     // Force literal string matching (-F flag) instead of regex
-  skipInitialWait?: boolean;   // BRC: blocking callers wait on events themselves (no 40ms first-chunk wait)
+  skipInitialWait?: boolean;   // Blocking callers wait on events themselves.
 }
 
 /**
@@ -407,17 +407,29 @@ export interface SearchSessionOptions {
 
     // Wait for first chunk of data or early completion instead of fixed delay
     // Excel search runs in background and results are merged via readSearchResults
-    const firstChunk = new Promise<void>(resolve => {
-      const onData = () => {
-        session.process.stdout?.off('data', onData);
-        resolve();
-      };
-      session.process.stdout?.once('data', onData);
-      setTimeout(resolve, 40); // cap at 40ms instead of 50-100ms
-    });
-
-    // Only wait for ripgrep first chunk - Excel results merge asynchronously
-    if (!options.skipInitialWait) await firstChunk;
+    if (!options.skipInitialWait) {
+      await new Promise<void>(resolve => {
+        const signal=getCallContext()?.signal;
+        const done=()=>{
+          clearTimeout(timer);
+          session.process.stdout?.off('data',done);
+          session.process.off('close',done);
+          session.process.off('error',done);
+          signal?.removeEventListener('abort',done);
+          resolve();
+        };
+        // Empty and invalid searches often produce no stdout. Observe CLOSE
+        // after the session's error classifier instead of racing a fixed 40ms
+        // sleep. Valid first output still returns immediately; startup stays bounded.
+        const timer=setTimeout(done,250);
+        session.process.stdout?.once('data',done);
+        session.process.once('close',done);
+        session.process.once('error',done);
+        signal?.addEventListener('abort',done,{once:true});
+        if(signal?.aborted||session.isComplete)done();
+      });
+      checkCancelled();
+    }
 
     return {
       sessionId,

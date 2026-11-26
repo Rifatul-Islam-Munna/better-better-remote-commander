@@ -150,5 +150,5 @@ test('failure metadata gives safe actionable diagnosis without recording shell c
  assert.match(failureReason('run_command','COMMAND_FAILED','MODULE_RESOLUTION'),/cwd/);
  assert.match(failureReason('run_command','COMMAND_FAILED','GIT_NOT_REPOSITORY'),/repository/);
  assert.match(failureReason('read_code_file','ENOENT'),/does not exist/);
- assert.match(failureReason('run_command','TIMEOUT'),/start_process/);
+ assert.match(failureReason('run_command','TIMEOUT'),/spawn_job.*get_job\/wait_jobs/);
 });

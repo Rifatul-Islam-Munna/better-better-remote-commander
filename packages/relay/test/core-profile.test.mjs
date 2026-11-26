@@ -1,5 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {CODE_MODE_DISCOVERY_DESCRIPTION} from 'brc-shared';
 import {BUNDLED_AGENT_TOOL_CATALOG} from '../dist/mcp/agent-tools.catalog.js';
 import {liveTools,composeMcpToolList,exposeMcpAgentTool,mcpToolProfile,RETIRED_PUBLIC_AGENT_TOOLS,CODEMODE_MCP_AGENT_TOOLS,CORE_MCP_AGENT_TOOLS,FOCUSED_MCP_AGENT_TOOLS,CODEMODE_TOOL_ROUTING_GUIDANCE,CORE_TOOL_ROUTING_GUIDANCE,readOnlyToolAllowed} from '../dist/mcp/server.js';
 
@@ -32,6 +33,8 @@ test('retired overlapping tools are not advertised by ANY profile, but essential
   assert.ok(compactWithRecovery.some(t=>t.name==='recover_operation'));
   assert.ok(!compactWithRecovery.some(t=>t.name==='list_skills'));
   assert.match(CODEMODE_TOOL_ROUTING_GUIDANCE,/code_mode FIRST/);
+  assert.match(CODEMODE_TOOL_ROUTING_GUIDANCE,/tools.parallelSafe/);
+  assert.equal(code.find(t=>t.name==='code_mode').description,CODE_MODE_DISCOVERY_DESCRIPTION);
   process.env.BRC_MCP_TOOL_PROFILE='core';
   const core=(await liveTools(hub,store,account)).tools;
   const names=new Set(core.map(t=>t.name));
@@ -91,4 +94,13 @@ test('retired overlapping tools are not advertised by ANY profile, but essential
   if(before===undefined)delete process.env.BRC_MCP_TOOL_PROFILE;
   else process.env.BRC_MCP_TOOL_PROFILE=before;
  }
+});
+
+test('stale connected agents cannot erase current Code Mode onboarding',async()=>{
+ const device={deviceId:'guidance-fixture',info:{platform:'win32'},tools:[{name:'code_mode',description:'old sequential description',inputSchema:{type:'object',properties:{source:{type:'string'}}}}]};
+ const hub={list:()=>[device],get:()=>device},store={getDevice:async()=>({paused:false})};
+ const result=await liveTools(hub,store,'guidance-fixture-user');
+ const tool=result.tools.find(t=>t.name==='code_mode');
+ assert.equal(tool.description,CODE_MODE_DISCOVERY_DESCRIPTION);
+ assert.equal(tool.inputSchema.properties.source.type,'string','live schemas remain authoritative');
 });

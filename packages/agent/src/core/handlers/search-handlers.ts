@@ -100,6 +100,8 @@ export async function handleStartSearch(args: unknown): Promise<ServerResult> {
 
     return {
       content: [{ type: "text", text: output }],
+      structuredContent:{sessionId:result.sessionId,isComplete:result.isComplete,
+        totalMatches:result.totalResults,actualSearchMode:parsed.data.literalSearch?'literal':'regex'},
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

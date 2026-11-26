@@ -127,7 +127,16 @@ export class BoundedLocalStore {
       const temp=dest+'.'+process.pid+'.'+randomBytes(5).toString('hex')+'.tmp';
       try{
         await fs.writeFile(temp,bytes,{flag:'wx',mode:0o600});
-        await fs.rename(temp,dest);
+        // Windows scanners/readers can briefly hold the existing record.
+        // Retry only publication of this already-written agent-owned snapshot;
+        // never replay a tool, remove the destination or bypass quota checks.
+        for(let attempt=0;;attempt++){
+          try{await fs.rename(temp,dest);break;}
+          catch(error){
+            if(attempt>=4||!['EPERM','EACCES','EBUSY'].includes((error as NodeJS.ErrnoException).code??''))throw error;
+            await new Promise(resolve=>setTimeout(resolve,25*(attempt+1)));
+          }
+        }
       }finally{await fs.unlink(temp).catch(()=>{});}
       const pruned=await this.pruneLocked(dest);
       const current=await fs.stat(dest).catch(()=>null);
@@ -149,7 +158,9 @@ export class BoundedLocalStore {
       if(!st.isFile()||st.isSymbolicLink()||st.size>this.maxRecordBytes)return null;
       const raw=await fs.readFile(file,'utf8');
       const value=JSON.parse(raw) as T;
-      void fs.utimes(file,new Date(),new Date()).catch(()=>{});
+      // Finish the metadata handle before a caller immediately replaces this
+      // record; fire-and-forget touches can race Windows atomic publication.
+      await fs.utimes(file,new Date(),new Date()).catch(()=>{});
       return value;
     }catch{return null;}
   }

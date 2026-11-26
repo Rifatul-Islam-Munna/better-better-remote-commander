@@ -42,6 +42,7 @@ import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} fro
 import {adaptiveToolBudget,projectAdaptiveToolResult,adaptiveFinalText} from './adaptive-result-budget.js';
 import {getVerificationEvidence,isTrackedMutation,isVerificationOperation} from './verification-evidence.js';
 import {SpecialistRoutingPolicy,specialistPolicyStatus} from './specialist-policy.js';
+import {codeModeHelp,CODE_MODE_HELP_TOPICS} from './code-mode-help.js';
 
 type Args = Record<string,unknown>;
 type Executor = (name:string,args:Args)=>Promise<ToolResult>;
@@ -55,7 +56,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'QuickJS body ending with return. Use tools.agent.specialist for independent workstreams; complex/multi-domain calls auto-route. Large results stay local via result handles. No Node/fs/fetch.'),
+    'QuickJS body ending with return. Start with await tools.help(); use tools.parallelSafe for independent safe reads. Host can submit independent code_mode calls concurrently. Features: tools.help("features"). Ordinary calls/specialists stay sequential. No Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -80,6 +81,12 @@ export const CODE_MODE_ALLOWED_TOOLS=new Set([
 ]);
 
 const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
+  {
+    name:'code_mode_help',
+    description:'Code Mode onboarding: parallelism examples, full feature/API map and error recovery. Prefer await tools.help(topic); no tool execution or state writes.',
+    inputSchema:{type:'object',properties:{topic:{type:'string',enum:[...CODE_MODE_HELP_TOPICS]}}},
+    annotations:{readOnlyHint:true}
+  },
   {
     name:'parallel_safe',
     description:'Run a bounded DAG of agent-verified read-only tools concurrently inside Code Mode. The runtime rejects mutations/stateful cursor tools and adapts fanout to live machine pressure.',
@@ -422,7 +429,7 @@ export async function executeCodeMode(
       return {ok:false,error:{code:'CODE_MODE_CALL_LIMIT',message:'Nested tool call budget exhausted.'}};
     if(activeTool)
       return {ok:false,error:{code:'CODE_MODE_NESTED_PARALLEL_DENIED',
-        message:'This Code Mode workflow already has a nested tool call in flight. Keep nested calls sequential, or fan out as separate Code Mode workflows / approved job tools.'}};
+        message:'This Code Mode workflow already has a nested tool call in flight. Use tools.parallelSafe for independent safe reads, run_parallel for independent commands, or separate concurrent code_mode workflows. See tools.help("parallelism").'}};
     const def=names.get(name)!;
     const readOnly=def.annotations?.readOnlyHint===true;
     let effectiveRole=role;
@@ -630,7 +637,7 @@ export async function executeCodeMode(
       if(request.type==='search'){
         if(typeof request.query!=='string'||request.query.length>160)
           return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Search query must be a short string.'}};
-        const harnessIntent=/\b(?:semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip|parallel|pressure|heavy|worker|dag|worktree|coordination)\b/i.test(request.query);
+        const harnessIntent=/\b(?:help|features?|capabilities|semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip|parallel|pressure|heavy|worker|dag|worktree|coordination)\b/i.test(request.query);
         return {ok:true,value:search(harnessIntent?discoveryCatalog:catalogView,request.query)};
       }
       const name=request.name;
@@ -990,6 +997,13 @@ export async function executeCodeMode(
         return {ok:false,error:{code,message:error instanceof Error?error.message.slice(0,700):'Round-trip accelerator operation failed.'}};
       }
     }
+    if(request.type==='harness'&&request.name==='help'){
+      const a=request.args&&typeof request.args==='object'&&!Array.isArray(request.args)?request.args as Args:{};
+      const topic=a.topic??'overview';
+      if(typeof topic!=='string'||!CODE_MODE_HELP_TOPICS.some(t=>t===topic))
+        return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Code Mode help topics: '+CODE_MODE_HELP_TOPICS.join(', ')}};
+      return {ok:true,value:codeModeHelp(topic)};
+    }
     if(request.type==='harness'&&request.name==='status')
       return {ok:true,value:{...(await harnessVNextStatus()),roundtrip:await roundTripAcceleratorStatus(),
         livePressure:systemPressureStatus(),heavyTaskPolicy:heavyTaskPolicyStatus(),
@@ -1031,6 +1045,8 @@ export async function executeCodeMode(
       if(typeof request.name!=='string'||!request.args||typeof request.args!=='object'||Array.isArray(request.args))
         return {ok:false,error:{code:'INVALID_ARGUMENT',message:'tools.call requires a permitted tool name and argument object.'}};
       const virtualArgs=request.args as Record<string,unknown>;
+      if(request.name==='code_mode_help')
+        return handleRpc({type:'harness',name:'help',args:virtualArgs});
       if(request.name==='parallel_safe')
         return handleRpc({type:'parallel',args:virtualArgs});
       if(request.name==='semantic_project_search')

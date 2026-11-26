@@ -4,6 +4,8 @@ The default Code Mode-first MCP profile exposes 14 main tools (15 with recovery)
 
 ## Code Mode
 
+Use `await tools.help()` for the guest feature map and `tools.help("parallelism")` for runnable parallel patterns. Independent safe reads use `tools.parallelSafe`; independent outer workflows can use concurrent host MCP calls. The agent/relay share this onboarding without generic description truncation. Specialist roles remain sequential permission scopes; they do not create concurrent AI workers. See the Code Mode guide for exact admission limits and live peak counters.
+
 The agent uses `code_mode` FIRST in the default 14–15-tool `codemode` relay catalog; set `BRC_MCP_TOOL_PROFILE=core` to expose the previous 40 tools directly. Its JavaScript guest runs in a bounded QuickJS/WASM worker on the **local paired device** and has no Node.js, `require`, process, filesystem or network globals. Only the injected `tools.search`, `tools.describe`, and `tools.call` bridge is available. Every called tool still applies existing source validation, cancellation, path policy, runtime limits, receipts, and permission checks. For long-running builds create BRC jobs and follow them with `get_job` or `wait_jobs`; do not treat started jobs as completed. No production restart or installed third-party MCP approval is implicit. See [tool discovery and Code Mode](chatgpt-mcp-tool-guide.md).
 
 ## Run your checkout

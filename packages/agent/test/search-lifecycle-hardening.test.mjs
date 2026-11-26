@@ -88,7 +88,9 @@ test('cancelled blocking search always terminates its session before returning C
     assert.equal(result.structuredContent?.error?.code,'CANCELLED',text(result));
     assert.ok(waitCalls>=1,'must reach blocking wait');
     assert.ok(stopped>=1,'must release the cancelled search subscription');
-    await new Promise(resolve=>setTimeout(resolve,65));
+    const closedBy=Date.now()+2500;
+    while(searchManager.getActiveSessionCount()>0&&Date.now()<closedBy)
+      await new Promise(resolve=>setTimeout(resolve,25));
     assert.equal(searchManager.getActiveSessionCount(),0,'last subscriber cancellation stops the ripgrep worker');
   }finally{
     searchManager.readSearchResults=actualRead;

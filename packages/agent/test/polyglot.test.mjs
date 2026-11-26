@@ -119,7 +119,9 @@ test('parser cancellation leaves the event loop usable',async()=>{
 class Sock extends EventEmitter{OPEN=1;readyState=1;bufferedAmount=0;sent=[];send(s){this.sent.push(JSON.parse(s));}close(){this.readyState=3;this.emit('close');}terminate(){this.close();}}
 const hello=(id,tool='read_file')=>Buffer.from(JSON.stringify({type:'hello',protocol:1,device:{deviceId:id,name:id,platform:'test'},tools:[{name:tool,description:'test',inputSchema:{type:'object'}}]}));
 test('relay schema cache preserves stable discovery while device pause and reconnect remain fresh',async()=>{
+ const profile=process.env.BRC_MCP_TOOL_PROFILE;process.env.BRC_MCP_TOOL_PROFILE='core';
  const h=new DeviceHub('test',()=>{}),s=new Sock();h.attach(s,'u','pc');s.emit('message',hello('pc'));
+ try{
  let paused=false;const store={getDevice:()=>({paused:paused?1:0})};
  const first=await liveTools(h,store,'u'),second=await liveTools(h,store,'u');assert.equal(first.tools,second.tools);
  const stable=first.tools.map(t=>t.name);assert.ok(stable.length>=30,'core profile should advertise the essential tools');
@@ -142,7 +144,7 @@ test('relay schema cache preserves stable discovery while device pause and recon
  assert.ok(selected.inputSchema.properties.deviceId,'device targeting remains available');
  const other=await liveTools(h,store,'other');assert.equal(other.online,0);
  assert.deepEqual(other.tools.map(t=>t.name),stable,'static catalog is public schema; device ownership is still enforced by invocation');
- h.close();
+ }finally{h.close();if(profile===undefined)delete process.env.BRC_MCP_TOOL_PROFILE;else process.env.BRC_MCP_TOOL_PROFILE=profile;}
 });
 test('relay overload rejects before dispatch and per-device limits do not block other devices',async()=>{
  const h=new DeviceHub('test',()=>{}),a=new Sock(),b=new Sock();h.attach(a,'u','a');h.attach(b,'u','b');a.emit('message',hello('a'));b.emit('message',hello('b'));

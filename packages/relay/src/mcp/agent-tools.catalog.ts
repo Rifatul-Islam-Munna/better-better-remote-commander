@@ -4,7 +4,7 @@ import type { ToolDefinition } from 'brc-shared';
 export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
   {
     "name": "code_mode",
-    "description": "USE WHEN: PRIMARY DEFAULT for most multi-step coding, debugging, project exploration, testing and installed-plugin workflows; combine dependent tool operations with local JavaScript and progressive discovery in one remote MCP call.\nUSE INSTEAD: For a simple read/edit/command use its direct tool; for builds longer than one MCP call use spawn_job then get_job/wait_jobs.\nIMPORTANT: Guest code runs in a bounded QuickJS/WASM worker and can only call permitted BRC tool methods. No Node modules or native host objects. Errors stop the workflow; never blindly replay uncertain changes.\nDETAILS: USE WHEN: PRIMARY DEFAULT for multi-step coding, testing, debugging, project research and installed-plugin workflows. Compose dependent calls, branching and filtered outputs in one MCP request. USE INSTEAD: Direct read_file/edit_bloc\n[Full parameter details: tool input schema.]",
+    "description": "USE WHEN: PRIMARY DEFAULT for multi-step work. Use tools.parallelSafe for independent safe reads; send independent code_mode workflows concurrently when the host supports concurrent calls.\nUSE INSTEAD: Use direct tools only for one simple action or unavailable/unsupported Code Mode; large or truncated Code Mode output is NOT a fallback signal.\nIMPORTANT: Start unfamiliar work with await tools.help(). Ordinary tools.call operations stay sequential. Specialists are local permission scopes, not extra LLMs. Stay in Code Mode for continuations; never replay uncertain mutations.\nHOW / NEXT: START: const help=await tools.help(); discover exact schemas with tools.search/describe. PARALLEL: await tools.parallelSafe([{tool:\"git_status\",args:{path:root}},{tool:\"git_diff\",args:{path:root}}],{max_concurrency:3}); inspect structuredContent and pending jobs. For independent commands/DAGs discover run_parallel. For independent multi-step work submit separate code_mode calls concurrently: up to 12 admitted / 8 runnable globally, 1-3 runnable per project, adapted to CPU/RAM pressure. These are limits, not a target worker count. DEPENDENCIES: await reads before edits; serialize overlapping writes. Never Promise.all ordinary tools.call or specialist runs inside one workflow. FEATURES: tools.help(\"features\") covers semantic search, saved workflows/snippets, project sessions, result handles, durable steps/resume, reusable terminal/browser sessions, fibers, specialists, native-worker coordination, live status/traces and job recovery. NEXT: follow local result handles/pages; inspect get_job/wait_jobs for unfinished work. Await every operation; return compact verified evidence.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -12,7 +12,7 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
           "type": "string",
           "minLength": 1,
           "maxLength": 50000,
-          "description": "JavaScript function BODY ending with return. Available API: tools.search(query), tools.describe(name), tools.call(name,args). Standard loops, branching, arrays, JSON and await are supported. No Node imports, filesystem access, fetch or process globals."
+          "description": "QuickJS body ending with return. Start with await tools.help(); use tools.parallelSafe for independent safe reads. Host can submit independent code_mode calls concurrently. Features: tools.help(\"features\"). Ordinary calls/specialists stay sequential. No Node/fs/fetch."
         },
         "max_runtime_ms": {
           "type": "integer",
@@ -3615,7 +3615,7 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
   },
   {
     "name": "worker_tasks",
-    "description": "USE WHEN: Coordinate 2–4 independent scopes ONLY when the AI host actually provides separately running workers with BRC access.\nUSE INSTEAD: Do not pretend this tool spawns LLM workers; for one model use batch_tools/workspace_batch.\nIMPORTANT: Owned scopes, dependencies and coordinatorKey are required.\nHOW / NEXT: START: host-native subagents only. Claim before working, renew a 15-minute default lease before expiry; new-directory scope ends with /. NEXT: workers submit via worker_patch; parent preview/apply/verify via worker_integrate.\nDETAILS: Optional host-native parallel coding coordination. create(path,goal,tasks with owned scope/dependsOn), status, coordinator-authorized resume (after a checkpoint is restored), claim(workerId, optional reads), renew/release, coordinator reset/set_checks/cancel. If the host tr\n[Full parameter details: tool input schema.]",
+    "description": "USE WHEN: Coordinate 2–4 independent scopes ONLY when the AI host actually provides separately running workers with BRC access.\nUSE INSTEAD: Do not pretend this tool spawns LLM workers; for one model use batch_tools/workspace_batch.\nIMPORTANT: Owned scopes, dependencies and coordinatorKey are required.\nHOW / NEXT: START: host-native subagents only. Claim before working, renew a 15-minute default lease before expiry; new-directory scope ends with /. NEXT: workers submit via worker_patch; parent preview/apply/verify via worker_integrate.\nDETAILS: Global coding DAG. create tasks with scope/dependsOn/priority/supersedes; claim steals the highest-priority ready node. Only 2+ independent writers on a clean Git root can get temporary worktreePath; edit only it, then capture_worktree. Worktrees are deleted after capture/r\n[Full parameter details: tool input schema.]",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3630,6 +3630,8 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
             "release",
             "reset",
             "set_checks",
+            "cancel_obsolete",
+            "capture_worktree",
             "cancel"
           ]
         },
@@ -3678,6 +3680,18 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
               "readOnly": {
                 "type": "boolean",
                 "default": false
+              },
+              "priority": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "supersedes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/properties/tasks/items/properties/id"
+                },
+                "maxItems": 31
               }
             },
             "required": [
@@ -3740,6 +3754,11 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
           "maximum": 3600,
           "default": 900
         },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
         "reads": {
           "type": "array",
           "items": {
@@ -3784,7 +3803,7 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
   },
   {
     "name": "worker_patch",
-    "description": "USE WHEN: Let a real claimed worker submit proposed hash-checked changes for its assigned scope.\nUSE INSTEAD: Do not directly write shared files or pretend a worker was spawned.\nIMPORTANT: Submitting a patch does not apply it or prove tests passed.\nHOW / NEXT: START: scoped, claimed worker proposes hash-checked changes. No source is written. NEXT: coordinator preview/apply, not direct writes.\nDETAILS: A claimed worker submits a proposed UTF-8 patch using planId/taskId/claimKey/submissionId, summary and up to 16 changes (same shape as workspace_batch). Exact hashes required; null means create-only. Validates owned canonical paths and current hashes, but writes NO project files. Read-only tasks submit summary and no changes. Same submissionId/payload replay is idempotent; expired/replaced claims cannot submit. 2 MiB\n[Full parameter details: tool input schema.]",
+    "description": "USE WHEN: Let a real claimed worker submit proposed hash-checked changes for its assigned scope.\nUSE INSTEAD: Do not directly write shared files or pretend a worker was spawned.\nIMPORTANT: Submitting a patch does not apply it or prove tests passed.\nHOW / NEXT: START: scoped, claimed worker proposes hash-checked changes. No source is written. NEXT: coordinator preview/apply, not direct writes.\nDETAILS: Submit a claimed task's staged UTF-8 patch with exact hashes; writes no shared files. Eligible worktrees should use worker_tasks capture_worktree, which converts the diff to the same staged-patch path and deletes the checkout. Read-only tasks submit findings only; replays are idempotent; 2 MiB/patch.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3890,7 +3909,7 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
   },
   {
     "name": "worker_integrate",
-    "description": "USE WHEN: Let the coordinator preview, apply and verify workers proposed changes using coordinatorKey.\nUSE INSTEAD: For a single AI or unrelated edits use workspace_batch; do not claim worker completion before integration.\nIMPORTANT: Requires review digest, checks and current hashes; source changes remain gated.\nHOW / NEXT: START: coordinator previews, then applies using the fresh review_sha256; run real checks and finish only after passing fresh verification. NEXT: if failure or unclear commit, inspect plan/status and current hashes before retrying.\nDETAILS: Parent-only preview/apply/verify/finish with coordinatorKey. Preview validates selected submitted tasks and returns review_sha256; apply requires that digest, rechecks hashes and commits through workspace_batch with rollback safeguards. Wait for active claims\n[Full parameter details: tool input schema.]",
+    "description": "USE WHEN: Let the coordinator preview, apply and verify workers proposed changes using coordinatorKey.\nUSE INSTEAD: For a single AI or unrelated edits use workspace_batch; do not claim worker completion before integration.\nIMPORTANT: Requires review digest, checks and current hashes; source changes remain gated.\nHOW / NEXT: START: coordinator previews, then applies using the fresh review_sha256; run real checks and finish only after passing fresh verification. NEXT: if failure or unclear commit, inspect plan/status and current hashes before retrying.\nDETAILS: Parent preview/apply/verify/rollback/finish. Apply returns a bounded hash-guarded rollbackSnapshotId. rollback refuses changed files or later dependent applied tasks. Final verify/finish requires fresh checks.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -3900,6 +3919,7 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
             "preview",
             "apply",
             "verify",
+            "rollback",
             "finish"
           ],
           "default": "preview"
@@ -3923,6 +3943,10 @@ export const BUNDLED_AGENT_TOOL_CATALOG: ToolDefinition[] = [
           "maxItems": 32
         },
         "review_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "rollback_id": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
         },

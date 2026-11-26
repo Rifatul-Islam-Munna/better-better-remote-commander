@@ -94,7 +94,7 @@ test('settings temporarily holds only bounded live log output and never persists
 const children = new Set();
 function childCli(home, args) {
   // Loopback CLI tests must not download real plugins; startup installation is covered by plugins.test.mjs.
-  const env = { ...process.env, BRC_HOME: home, BRC_LOG_LEVEL: 'info', BRC_PLUGINS: 'none',
+  const env = { ...process.env, BRC_HOME: home, BRC_LOG_LEVEL: 'info', BRC_PLUGINS: 'none', BRC_TOOL_HISTORY:'0',
     // This integration test explicitly asserts START events while a tool runs.
     BRC_CONSOLE_MODE: 'verbose' };
   for (const key of ['BRC_RELAY', 'BRC_TOKEN', 'BRC_DEVICE_ID', 'BRC_NAME', 'NODE_TEST_CONTEXT']) delete env[key];

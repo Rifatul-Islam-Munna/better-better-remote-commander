@@ -108,6 +108,7 @@ async function execute():Promise<unknown>{
       ' return {matched:true,id:match.id,name:match.name,score:match.score,value};',
       '};',
       'const tools = Object.freeze({',
+      ' help(topic="overview") { return __rpc({type:"harness",name:"help",args:{topic}}); },',
       ' search(query) { return __rpc({type:"search",query}); },',
       ' describe(name) { return __rpc({type:"describe",name}); },',
       ' call(name,args={}) { return name==="saved_workflow_run" ? __workflowRun(args.query,args.context||{}) : __rpc({type:"call",name,args}); },',

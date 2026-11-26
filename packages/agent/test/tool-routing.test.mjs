@@ -76,7 +76,9 @@ test('tool descriptions lead with actionable next calls and enforce discovery bu
   const advertisedBytes=Buffer.byteLength(JSON.stringify(definitions),'utf8');
   // One intentionally added Code Mode schema costs about 1.8 KiB in the
   // full compatibility catalog; Core remains capped at 40 visible tools.
-  assert.ok(advertisedBytes<114000,'tool catalog metadata grew unexpectedly: '+advertisedBytes);
+  // Complete primary Code Mode onboarding intentionally adds <=2 KiB; all
+  // other tools retain their existing compact budgets and tool count.
+  assert.ok(advertisedBytes<116000,'tool catalog metadata grew unexpectedly: '+advertisedBytes);
 });
 
 test('the tool-routing helper changes descriptions ONLY, not names, schema or access annotations', () => {
@@ -89,4 +91,11 @@ test('the tool-routing helper changes descriptions ONLY, not names, schema or ac
   assert.strictEqual(modified.annotations, annotations);
   assert.equal(original.description, 'Read one file.', 'source definitions remain unmodified');
   assert.match(modified.description, /DETAILS: Read one file\./);
+});
+
+test('Code Mode parallelism and feature discovery survive description compaction',()=>{
+ const d=byName.get('code_mode').description;
+ for(const term of ['tools.help','tools.parallelSafe','12 admitted / 8 runnable','semantic','result handles','specialists','fibers','sequential'])assert.ok(d.includes(term),'missing onboarding: '+term);
+ assert.equal(addToolChoice({name:'code_mode',description:'stale legacy text'}).description,d);
+ assert.ok(d.length<2600,'primary onboarding stays bounded');
 });

@@ -12,6 +12,7 @@ import type { RelayStore } from '../store/types.js';
 import { invokeTool, connectionStatus, type InvokeContext } from './invoke.js';
 import { BUNDLED_AGENT_TOOL_CATALOG } from './agent-tools.catalog.js';
 import { publicToolDescription } from './public-tool-descriptions.js';
+import {CODE_MODE_WORKFLOW_GUIDANCE} from 'brc-shared';
 import { handlePluginRelayTool, PLUGIN_RELAY_TOOLS } from './plugin-tools.js';
 import type { RegistryClient } from '../plugins/registry.js';
 import { SKILL_RELAY_TOOLS, handleSkillRelayTool } from './skill-tools.js';
@@ -282,6 +283,7 @@ export const CORE_TOOL_ROUTING_GUIDANCE = [
  * A fallback direct call is still encouraged for a single simple action.
  */
 export const CODEMODE_TOOL_ROUTING_GUIDANCE = [
+  CODE_MODE_WORKFLOW_GUIDANCE,
   'BRC CODE MODE FIRST (DEFAULT): For most coding, debugging, testing, project exploration and multistep MCP work, call code_mode FIRST. Write a small JavaScript function body with await tools.search(query), await tools.describe(exactName), await tools.call(exactName,args), conditional checks and a compact return value. This is ONE model-to-relay request: local nested tools do not create extra model turns.',
   'DISCOVERY: use tools.search for tool names, tools.describe to inspect the actual JSON parameter schema, and tools.call with correct arguments. Installed external MCP servers: await tools.call("list_plugin_tools",{...}) to inspect a ready plugin, then await tools.call("call_plugin_tool",{plugin,tool,args}) for the selected method. Computer/browser interaction requires an explicit user task; do not open apps or browsers during ordinary coding.',
   'RESULTS: use returned structuredContent and actual command exitCode / test status. A pending tool or background job is NOT finished. For long builds/tests spawn_job through Code Mode, return its jobId, then use the direct get_job/wait_jobs tool on subsequent turns. Default 48 nested calls, maximum 96; the workflow has a deadline, not an unlimited run.',

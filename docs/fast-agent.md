@@ -41,7 +41,7 @@ These caps reduce oversized MCP results but cannot guarantee that the independen
 
 ### Bounded parallel jobs
 
-`run_parallel` now uses a bounded 4-wide default and 8-wide hard cap, regardless of a higher requested concurrency. `BRC_MAX_JOBS` is bounded to 8 pooled jobs. Independent jobs can still run concurrently; do not write the same file from multiple jobs at once.
+`run_parallel` defaults to at most three concurrent jobs and adapts downward for task type and machine pressure. CPU-heavy builds/checks remain serialized. In Code Mode use `tools.parallelSafe` for stateless read DAGs; use `tools.help("parallelism")` for exact examples. Separate outer Code Mode workflows have their own adaptive scheduler (12 admitted / 8 runnable globally, 1-3 per project) and a dedicated transport lane. Neither limit creates tasks or extra AI models. Do not write the same file from multiple jobs at once.
 
 To avoid very large MCP replies, `run_parallel`, `wait_jobs`, and `get_job` cap their complete **combined** response at 128,000 characters. If a response says `MORE PARALLEL RESULTS`, use its group with `wait_jobs({group: "par-..."})` to retrieve still-unreported jobs, **not another run_parallel call**. For a long multi-step job, call `get_job({id,step_offset:0,step_limit:10,output_chars:8000})`, and follow the returned `MORE JOB STEPS` offset until complete. Jobs continue when output is truncated; it is never safe to blindly replay a timed-out mutation.
 

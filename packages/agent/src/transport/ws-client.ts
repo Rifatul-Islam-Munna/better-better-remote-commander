@@ -3,6 +3,7 @@ import os from 'node:os';
 import { DEFAULTS,BRC_PROTOCOL_VERSION,parseMessage,type AgentMessage,type RelayMessage,type CallMessage,type DeviceInfo,type ToolDefinition,type ToolResult } from 'brc-shared';
 import { withCallContext } from '../context.js';
 import { OperationScheduler,cancelOperation } from '../runtime/operations.js';
+import {CODE_MODE_MAX_ADMITTED} from 'brc-shared';
 import { AgentError,failure } from '../runtime/errors.js';
 import { PluginAdmin } from './plugin-admin.js';
 import { isTermuxRuntime } from '../runtime/platform-capabilities.js';
@@ -28,6 +29,10 @@ export class WsClient {
  private reconnectTimer?:NodeJS.Timeout;
  private unauthorizedCount=0;
  private scheduler=new OperationScheduler(Math.min(3,Math.max(1,Number(process.env.BRC_MAX_CONCURRENCY)||(isTermuxRuntime()?2:3))),isTermuxRuntime()?16:32);
+ // Code Mode owns adaptive runnable/project admission internally. Keep a
+ // separate bounded outer lane for cancellation/deadlines so parked workflows
+ // do not occupy all three ordinary tool slots or block status/job recovery.
+ private codeModeCalls=new OperationScheduler(CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_ADMITTED);
  private seen=new Map<string,number>();
  private readonly log:NonNullable<WsClientOptions['log']>;
  private readonly plugins:PluginAdmin;
@@ -49,7 +54,7 @@ export class WsClient {
  start():void{if(this.ws)return;this.stopped=false;this.welcomed=false;this.plugins.start();this.connect();}
  /** O(1) live console status; no heartbeat poll or network request. */
  status(){return {online:this.welcomed && this.ws?.readyState===WebSocket.OPEN,connecting:!!this.ws&&this.ws.readyState===WebSocket.CONNECTING,inFlight:this.callsInFlight,health:connectionHealth.snapshot(),resultSpool:this.spool.status()};}
- stop():void{this.stopped=true;this.welcomed=false;this.plugins.stop();clearTimeout(this.pongTimer);clearTimeout(this.reconnectTimer);clearInterval(this.probeTimer);this.scheduler.cancelAll('Agent stopping.');const ws=this.ws;this.ws=null;ws?.close(1000,'agent stopped');}
+ stop():void{this.stopped=true;this.welcomed=false;this.plugins.stop();clearTimeout(this.pongTimer);clearTimeout(this.reconnectTimer);clearInterval(this.probeTimer);this.scheduler.cancelAll('Agent stopping.');this.codeModeCalls.cancelAll('Agent stopping.');const ws=this.ws;this.ws=null;ws?.close(1000,'agent stopped');}
  /** Pause only when idle: opening settings never cancels an in-flight tool call. */
  pauseForSettings():boolean{if(this.callsInFlight>0)return false;this.settingsPaused=true;return true;}
  resumeAfterSettings():void{this.settingsPaused=false;}
@@ -67,6 +72,7 @@ export class WsClient {
    clearTimeout(this.pongTimer);clearInterval(this.probeTimer);this.ws=null;this.welcomed=false;
    connectionHealth.record('disconnected',code,this.callsInFlight);
    this.scheduler.cancelAll('Relay disconnected; active operations are not automatically retried.');
+   this.codeModeCalls.cancelAll('Relay disconnected; active operations are not automatically retried.');
    if(this.stopped)return;
    if(code===4401||code===4403||unauthorized){void this.handleUnauthorized();return;}
    this.log('warn',`Disconnected (${code}); reconnecting`);this.retry();
@@ -143,7 +149,8 @@ export class WsClient {
        return await this.opts.callTool(msg.tool,msg.args) as ToolResult;
      });
    };
-   out=['agent_status','cancel_operation','stop_search','force_terminate'].includes(msg.tool)?await run():await this.scheduler.run(msg.id,msg.tool,timeout,run);
+   out=['agent_status','cancel_operation','stop_search','force_terminate'].includes(msg.tool)?await run():
+     await (msg.tool==='code_mode'?this.codeModeCalls:this.scheduler).run(msg.id,msg.tool,timeout,run);
   }catch(err){out=failure(err,msg.id);}
   // Persist ONLY the observed outcome, not any arguments or payload.
   // Await settlement before the socket send: disconnect between these

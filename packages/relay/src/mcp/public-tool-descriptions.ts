@@ -1,4 +1,5 @@
 import type { ToolDefinition } from 'brc-shared';
+import {CODE_MODE_DISCOVERY_DESCRIPTION} from 'brc-shared';
 
 /** Curated public descriptions. Legacy agent catalogs remain unchanged for
  * compatibility, but models must never be told to call retired tool names.
@@ -26,5 +27,6 @@ const descriptions:Record<string,string>={
  worker_integrate:'USE WHEN: The parent coordinator previews then applies worker-proposed patches and verifies selected checks. USE INSTEAD: worker_tasks for claim status, worker_patch for submissions. IMPORTANT: This tool uses an INTERNAL validated batch engine; no public multi-write tool is exposed. Requires coordinatorKey and current review hash, not just worker claims.',
 };
 export function publicToolDescription(tool:ToolDefinition):string {
+ if(tool.name==='code_mode')return CODE_MODE_DISCOVERY_DESCRIPTION;
  return descriptions[tool.name] ?? tool.description;
 }

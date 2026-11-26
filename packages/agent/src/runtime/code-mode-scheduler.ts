@@ -8,9 +8,10 @@
 import os from 'node:os';
 import {AgentError} from './errors.js';
 import {systemPressureStatus} from './system-pressure.js';
+import {CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_RUNNABLE} from 'brc-shared';
 
-const MAX_ADMITTED=12;
-const HARD_MAX_ACTIVE=8;
+const MAX_ADMITTED=CODE_MODE_MAX_ADMITTED;
+const HARD_MAX_ACTIVE=CODE_MODE_MAX_RUNNABLE;
 const QUEUE_TIMEOUT_MS=90_000;
 const PER_WORKER_MEMORY_BUDGET=768*1024*1024;
 const MIN_MEMORY_RESERVE=2*1024*1024*1024;

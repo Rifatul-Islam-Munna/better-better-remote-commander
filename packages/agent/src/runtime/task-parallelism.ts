@@ -2,6 +2,7 @@
  * This does not plan work; it only caps concurrency for work the calling AI already requested.
  */
 import {systemPressureStatus} from './system-pressure.js';
+import {MAX_LIGHTWEIGHT_PARALLELISM,lightweightConcurrencyLimit} from './parallel-capacity.js';
 
 type StepLike={tool?:string;args?:Record<string,unknown>;command?:string;cwd?:string};
 export type WorkloadClass='read'|'search'|'semantic'|'plugin'|'mutation'|'verification'|'build'|'process'|'general';
@@ -31,27 +32,26 @@ export function classifyWorkload(step:StepLike):WorkloadClass{
   if(PROCESS.has(tool))return 'process';
   return 'general';
 }
-export function adaptiveTaskConcurrency(calls:readonly StepLike[],requested=3){
+export function adaptiveTaskConcurrency(calls:readonly StepLike[],requested=MAX_LIGHTWEIGHT_PARALLELISM){
   const pressure=systemPressureStatus();
   const classes=calls.map(classifyWorkload);
   const counts=Object.fromEntries([...new Set(classes)].map(c=>[c,classes.filter(x=>x===c).length])) as Partial<Record<WorkloadClass,number>>;
   const heavy=(counts.build??0)+(counts.verification??0);
-  let base=3;
+  let base=lightweightConcurrencyLimit();
   if(classes.length<=1)base=1;
   else if(classes.every(c=>c==='build'||c==='verification'))base=1;
   else if(heavy>0)base=2; // one heavy lane + one responsive/light lane
   else if((counts.mutation??0)>0)base=2;
   else if((counts.semantic??0)>0)base=2;
   else if((counts.plugin??0)>0&&classes.every(c=>c==='plugin'))base=2;
-  if(pressure.level==='warm')base=Math.min(base,2);
-  if(pressure.level==='high'||pressure.level==='critical')base=1;
-  const effective=Math.max(1,Math.min(3,Math.trunc(requested)||1,base,pressure.suggestedSafeParallelism));
-  return {requested:Math.max(1,Math.min(3,Math.trunc(requested)||1)),effective,classes,counts,pressure:pressure.level,
+  const effective=Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,Math.trunc(requested)||1,base,
+    Math.max(1,calls.length),pressure.suggestedSafeParallelism));
+  return {requested:Math.max(1,Math.min(MAX_LIGHTWEIGHT_PARALLELISM,Math.trunc(requested)||1)),effective,classes,counts,pressure:pressure.level,
     policy:heavy>0?'Heavy verification/build work keeps one slot while allowing at most one light companion lane.':
       (counts.mutation??0)>0?'Mutation groups are capped at two; file/path locks remain authoritative.':
-      'Read/search fanout may use up to three slots when machine pressure is normal.'};
+      'Lightweight fanout scales with hardware: up to six normally, three under moderate pressure, two under high pressure, one under critical pressure.'};
 }
 export function taskParallelismStatus(){
-  return {max:3,classes:['read','search','semantic','plugin','mutation','verification','build','process','general'],
+  return {max:MAX_LIGHTWEIGHT_PARALLELISM,hardwareLimit:lightweightConcurrencyLimit(),classes:['read','search','semantic','plugin','mutation','verification','build','process','general'],
     policy:'Concurrency follows requested task type plus live CPU/RAM/event-loop pressure. This layer never creates tasks or chooses a plan.'};
 }

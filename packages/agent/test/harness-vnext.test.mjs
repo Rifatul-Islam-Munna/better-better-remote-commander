@@ -580,7 +580,7 @@ test('live system pressure is exposed and scheduler capacity is pressure-aware',
   const scheduler=codeModeScheduler.status();
   assert.ok(['normal','warm','high','critical'].includes(pressure.level));
   assert.ok(pressure.scale>0&&pressure.scale<=1);
-  assert.ok(pressure.suggestedSafeParallelism>=1&&pressure.suggestedSafeParallelism<=3);
+  assert.ok(pressure.suggestedSafeParallelism>=1&&pressure.suggestedSafeParallelism<=6);
   assert.equal(scheduler.pressure.level,pressure.level);
   assert.ok(scheduler.activeLimit>=1&&scheduler.activeLimit<=scheduler.hardMaxActive);
   assert.ok(scheduler.cpu.slots<=scheduler.cpu.baseSlots);

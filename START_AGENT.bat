@@ -64,7 +64,7 @@ set "BRC_RESOURCE_PROFILE=responsive"
 rem Rolling newest 100 KiB of BRC activity in the local console; no disk transcript.
 if not defined BRC_ROLLING_LOG_UI set "BRC_ROLLING_LOG_UI=1"
 set "BRC_MAX_JOBS=1"
-set "BRC_MAX_CONCURRENCY=3"
+set "BRC_MAX_CONCURRENCY=6"
 set "BRC_PARSER_WORKERS=1"
 rem Avoid additional proxy/database processes unless explicitly enabled by owner.
 if not defined BRC_RTK set "BRC_RTK=0"
@@ -75,7 +75,7 @@ if errorlevel 1 (
   if "%~1"=="" pause
   exit /b 2
 )
-echo [BRC] Starting responsive agent: quick commands, up to 3 I/O calls, 1 heavy job...
+echo [BRC] Starting responsive agent: up to 6 hardware/load-adapted I/O calls, 1 heavy job...
 echo [BRC] Controls: M settings, S status, L activity, V verbose
 if "%~1"=="" (
   start "" /b /belownormal /wait node "%BRC_ROOT%packages\agent\dist\cli.js" --auto-connect

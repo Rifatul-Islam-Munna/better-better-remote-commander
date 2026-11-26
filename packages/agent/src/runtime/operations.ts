@@ -1,7 +1,7 @@
 import { AgentError } from './errors.js';
 interface Operation { id:string; tool:string; started:number; state:'queued'|'running'; controller:AbortController }
 const operations=new Map<string,Operation>();
-// One CPU-heavy operation at a time in every profile. Up to two lightweight
+// One CPU-heavy operation at a time in every profile. Other lightweight
 // operations may proceed beside it, keeping reads responsive during long builds.
 const HEAVY_TOOLS = new Set([
  'run_command','start_process','run_project_checks','verify_project',
@@ -21,7 +21,7 @@ export class OperationScheduler{
  private activeHeavy=0;
  private queue:Job<any>[]=[];
  private owned=new Set<Operation>();
- constructor(readonly concurrency=3,readonly capacity=32){}
+ constructor(readonly concurrency=3,readonly capacity=32,private liveLimit?:()=>number){}
  run<T>(id:string,tool:string,timeoutMs:number,task:(signal:AbortSignal)=>Promise<T>):Promise<T>{
   if(operations.has(id))return Promise.reject(new AgentError('DUPLICATE_CALL','Duplicate operation ID; not executed again.'));
   if(this.queue.length>=this.capacity)return Promise.reject(new AgentError('BUSY','Agent queue is full. Retry later.',true));
@@ -36,7 +36,8 @@ export class OperationScheduler{
  }
  private clean(job:Job<any>):void{clearTimeout(job.timer);job.operation.controller.signal.removeEventListener('abort',job.abort);if(operations.get(job.operation.id)===job.operation)operations.delete(job.operation.id);this.owned.delete(job.operation);}
  private drain():void{
-  while(this.active<this.concurrency && this.queue.length){
+  const limit=this.liveLimit?Math.max(1,Math.min(this.concurrency,Math.trunc(this.liveLimit())||1)):this.concurrency;
+  while(this.active<limit && this.queue.length){
    // A CPU-heavy job cannot occupy another core merely because I/O capacity is free.
    // Still admit following read-only jobs instead of blocking the whole connection.
    const i=this.queue.findIndex(j=>!isHeavyTool(j.operation.tool)||this.activeHeavy===0);

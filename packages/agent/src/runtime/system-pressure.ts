@@ -2,6 +2,7 @@
  * No user data, paths, commands, or outputs are stored. Samples stay in RAM only.
  */
 import os from 'node:os';
+import {pressureConcurrencyLimit} from './parallel-capacity.js';
 
 type PressureLevel='normal'|'warm'|'high'|'critical';
 interface CpuTotals {idle:number;total:number}
@@ -73,7 +74,7 @@ export function systemPressureStatus(){
     memory:{totalBytes,freeBytes,freeRatio:Math.round(freeRatio*1000)/1000},
     eventLoop:{lagP95Ms,samples:lagSamples.length},
     lastSampleAt,
-    suggestedSafeParallelism:level==='critical'?1:level==='high'?1:level==='warm'?2:3,
+    suggestedSafeParallelism:pressureConcurrencyLimit(level),
     policy:'RAM-only pressure sampler. Capacity shrinks under sustained CPU use, low free memory, or event-loop lag; it grows again automatically when pressure clears.',
   };
 }

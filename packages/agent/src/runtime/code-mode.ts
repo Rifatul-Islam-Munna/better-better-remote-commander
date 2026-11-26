@@ -36,6 +36,7 @@ import {classifyHeavyCodeModeTask,heavyTaskPolicyStatus} from './heavy-task-poli
 import {systemPressureStatus} from './system-pressure.js';
 import {runProjectPreflight,type ProjectPreflight} from './preflight-self-heal.js';
 import {adaptiveTaskConcurrency} from './task-parallelism.js';
+import {MAX_LIGHTWEIGHT_PARALLELISM} from './parallel-capacity.js';
 import {compactModelState} from './model-state-compression.js';
 import {SourceObservationLedger} from './stale-source-guard.js';
 import {checkpointRecoveryCapsule,latestRecoveryCapsule,type RecoveryStatus} from './recovery-capsule.js';
@@ -56,7 +57,7 @@ type WorkerMessage =
 
 export const CodeModeArgsSchema=z.object({
   source:z.string().min(1).max(50_000).describe(
-    'PARALLEL FIRST for suitable independent coding work: tools.parallelSafe for reads/searches/explicit run_command calls, concurrent outer code_mode calls when the host supports them. Await dependencies; serialize competing writes. Start with await tools.help(). Features: tools.help("features"). Ordinary calls/specialists stay sequential. QuickJS body ending with return; no Node/fs/fetch.'),
+    'PARALLEL FIRST for suitable independent coding work: tools.parallelSafe for reads/searches/explicit run_command calls; omit max_concurrency for hardware/load-adapted lightweight fanout up to 6. Concurrent outer code_mode calls when supported. Await dependencies; serialize competing writes. Start with await tools.help(). Features: tools.help("features"). Ordinary calls/specialists stay sequential. QuickJS body ending with return; no Node/fs/fetch.'),
   max_runtime_ms:z.number().int().min(1000).max(105_000).optional().default(85_000).describe(
     'Total workflow deadline. For long builds use tools.call("spawn_job",...) and inspect the returned job ID in a later MCP call.'),
   max_calls:z.number().int().min(1).max(96).optional().default(48).describe(
@@ -94,7 +95,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
       calls:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{
         tool:{type:'string'},args:{type:'object'},depends_on:{type:'array',items:{type:'integer',minimum:0}}
       }}},
-      max_concurrency:{type:'integer',minimum:1,maximum:3},
+      max_concurrency:{type:'integer',minimum:1,maximum:MAX_LIGHTWEIGHT_PARALLELISM,default:MAX_LIGHTWEIGHT_PARALLELISM},
       timeout_ms:{type:'integer',minimum:1000,maximum:100000},
       output_chars:{type:'integer',minimum:200,maximum:16000}
     }},annotations:{readOnlyHint:false,destructiveHint:true}
@@ -722,7 +723,7 @@ export async function executeCodeMode(
           await ensurePreflight(projectKey,commandCalls?'mutation':'read','parallel_safe');
         }
       }
-      const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):3;
+      const requested=typeof a.max_concurrency==='number'?Math.trunc(a.max_concurrency):MAX_LIGHTWEIGHT_PARALLELISM;
       const adaptive=adaptiveTaskConcurrency(safeCalls,requested);
       const maxConcurrency=adaptive.effective;
       // Deliver ordered child replies in RAM, after the normal dispatcher has

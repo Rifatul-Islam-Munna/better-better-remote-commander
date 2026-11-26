@@ -6,6 +6,7 @@
  * Hardware only caps concurrency; it never enables unbounded parallelism.
  */
 import os from 'node:os';
+import {lightweightHardwareLimit} from './parallel-capacity.js';
 
 export type ResourceProfile = 'normal';
 
@@ -29,13 +30,13 @@ const totalMemoryBytes = os.totalmem();
 const freeMemoryBytes = os.freemem();
 const profile: ResourceProfile = 'normal';
 const selection: ResourceProfileStatus['selection'] = 'automatic';
-const reason = 'normal mode is enforced on every PC; legacy responsive/auto overrides are ignored; worker concurrency is capped at three and CPU-heavy tasks are serialized';
+const reason = 'normal mode is enforced on every PC; legacy responsive/auto overrides are ignored; lightweight workers scale by CPU/RAM up to six, shrink under pressure, and CPU-heavy tasks are serialized';
 
 // Normalize stale launcher settings before any other runtime module is evaluated.
 process.env.BRC_RESOURCE_PROFILE = profile;
 delete process.env.BRC_LOW_RESOURCE_MODE;
 
-const hardwareWorkerLimit = Math.max(1, Math.min(3, cpuParallelism));
+const hardwareWorkerLimit = lightweightHardwareLimit(cpuParallelism,totalMemoryBytes);
 const maxConcurrentJobs = hardwareWorkerLimit;
 const maxToolConcurrency = hardwareWorkerLimit;
 const parserWorkers = Math.max(1, Math.min(2, cpuParallelism));

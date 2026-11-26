@@ -33,8 +33,8 @@ const text = r => (r.content ?? []).map(c => c.text ?? '').join('\n');
 
 test('Normal profile overrides stale responsive settings and tracks active work without forcing GC', () => {
   assert.equal(cacheStatus().resourceProfile, 'normal');
-  assert.ok(cacheStatus().hardware.maxConcurrentJobs >= 1 && cacheStatus().hardware.maxConcurrentJobs <= 3);
-  assert.ok(cacheStatus().hardware.maxToolConcurrency >= 1 && cacheStatus().hardware.maxToolConcurrency <= 3);
+  assert.ok(cacheStatus().hardware.maxConcurrentJobs >= 1 && cacheStatus().hardware.maxConcurrentJobs <= 6);
+  assert.ok(cacheStatus().hardware.maxToolConcurrency >= 1 && cacheStatus().hardware.maxToolConcurrency <= 6);
   assert.ok(cacheStatus().hardware.parserWorkers >= 1 && cacheStatus().hardware.parserWorkers <= 2);
   assert.equal(process.env.BRC_RESOURCE_PROFILE, 'normal');
   assert.equal(process.env.BRC_LOW_RESOURCE_MODE, undefined);

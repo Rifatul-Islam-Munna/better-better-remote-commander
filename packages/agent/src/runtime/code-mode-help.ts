@@ -1,14 +1,16 @@
 /** Bounded executable onboarding; no commands, model calls or state writes. */
 import {CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_RUNNABLE} from 'brc-shared';
+import {MAX_LIGHTWEIGHT_PARALLELISM,lightweightConcurrencyLimit} from './parallel-capacity.js';
 
 const parallelism = {
   default:'PARALLEL FIRST: Prefer parallel Code Mode for suitable independent coding work. Start independent reads/searches and explicit run_command calls with parallelSafe; submit independent outer code_mode workflows concurrently when the host supports it. Use sequential calls for dependencies or competing writes.',
-  safeReads:'await tools.parallelSafe([{tool:"git_status",args:{path:root}},{tool:"git_diff",args:{path:root}}],{max_concurrency:3})',
-  searches:'await tools.parallelSafe([{tool:"start_search",args:{path:root,pattern:"TODO",searchType:"content",wait:true,maxResults:20}},{tool:"start_search",args:{path:root,pattern:"test",searchType:"files",wait:true,maxResults:20}}],{max_concurrency:3})',
+  safeReads:'await tools.parallelSafe([{tool:"git_status",args:{path:root}},{tool:"git_diff",args:{path:root}}])',
+  searches:'await tools.parallelSafe([{tool:"start_search",args:{path:root,pattern:"TODO",searchType:"content",wait:true,maxResults:20}},{tool:"start_search",args:{path:root,pattern:"test",searchType:"files",wait:true,maxResults:20}}])',
+  capacity:'Omit max_concurrency for adaptive lightweight fanout up to six. Moderate/high/critical pressure lowers admission to 3/2/1; smaller machines use lower hardware caps. CPU-heavy commands/builds/tests stay serialized. An explicit lower max_concurrency is respected.',
   results:'parallelSafe returns an envelope: reply.results contains bounded replies in input order (text, structuredContent, isError, pending, jobId). reply.map(fn) maps those replies too. Read source from item.structuredContent.text; check outputTruncated/resultUnavailable and follow source next or get_job. Summary remains in reply.structuredContent. This is not an array of full unbounded results.',
   commands:'Explicit {tool:"run_command",args:{program,args,cwd}} calls also work in parallelSafe and route through normal run_parallel command/path checks and resource limits. Commands may mutate; choose independent work and serialize competing writes. Direct run_parallel also supports commands and depends_on DAGs.',
   workflows:'The calling AI host may submit independent code_mode requests concurrently. Each has an isolated QuickJS worker, ledger and cancellation signal. BRC never spawns another AI model.',
-  limits:{maxAdmitted:CODE_MODE_MAX_ADMITTED,maxRunnable:CODE_MODE_MAX_RUNNABLE,maxRunnablePerProject:3,maxSafeReadFanout:3,adaptive:true},
+  limits:{maxAdmitted:CODE_MODE_MAX_ADMITTED,maxRunnable:CODE_MODE_MAX_RUNNABLE,maxRunnablePerProject:3,maxSafeReadFanout:MAX_LIGHTWEIGHT_PARALLELISM,hardwareReadFanout:lightweightConcurrencyLimit(),adaptive:true},
   ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts independent verified reads, blocking start_search (omitted wait defaults to true) and explicit run_command calls; it rejects explicit wait:false, direct file mutations, search cursors and job-control tools before starting any calls. depends_on:[0] refers to an earlier call.',
   safety:'Await dependent reads before edits; serialize overlapping writes. Reduce fanout under pressure. Capacity is not a target worker count.',
   completion:'Inspect response.structuredContent, pending and actual exitCode. Follow get_job/wait_jobs for pending work; never rerun completed mutations to retrieve output.',

@@ -18,7 +18,6 @@
  */
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -39,6 +38,8 @@ import {classifyExecution} from '../runtime/execution-kernel.js';
 import {AgentError,failure} from '../runtime/errors.js';
 import {linkCallJobs} from '../runtime/call-outcomes.js';
 import {adaptiveTaskConcurrency} from '../runtime/task-parallelism.js';
+import {MAX_LIGHTWEIGHT_PARALLELISM,lightweightConcurrencyLimit} from '../runtime/parallel-capacity.js';
+import {systemPressureStatus} from '../runtime/system-pressure.js';
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -47,10 +48,9 @@ const MAX_WAIT_MS = 100_000; // stay well below the relay's 120 s call timeout
 const DEFAULT_WAIT_MS = 5_000;
 const DEFAULT_JOB_TIMEOUT_MS = 30 * 60_000;
 const MAX_JOB_TIMEOUT_MS = 6 * 60 * 60_000;
-const CPU_PARALLELISM = Math.max(1, typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length);
-// At most three background workers, scaled down on very small CPUs. A separate
+// At most six lightweight workers, scaled down by hardware and pressure. A separate
 // heavy-work gate below permits only one CPU-heavy job at a time.
-const HARDWARE_WORKER_LIMIT = Math.max(1, Math.min(3, CPU_PARALLELISM));
+const HARDWARE_WORKER_LIMIT = lightweightConcurrencyLimit();
 const MAX_CONCURRENT_JOBS = HARDWARE_WORKER_LIMIT;
 const MAX_QUEUED_JOBS = 64;
 const MAX_CONCURRENT_HEAVY_JOBS = 1;
@@ -217,7 +217,7 @@ const ParallelStepSchema=z.union([
 ]);
 export const RunParallelArgsSchema = z.object({
   calls: z.array(ParallelStepSchema).min(1).max(50).describe('Items execute concurrently when independent; optional depends_on:[0,1] names earlier zero-based call indices. Dependent calls start only when all prerequisites succeed.'),
-  max_concurrency: z.number().int().min(1).max(3).optional().default(3),
+  max_concurrency: z.number().int().min(1).max(MAX_LIGHTWEIGHT_PARALLELISM).optional().default(MAX_LIGHTWEIGHT_PARALLELISM),
   timeout_ms: z.number().int().min(1_000).max(MAX_WAIT_MS).optional().default(90_000)
     .describe('How long to wait for results. Calls still running then continue as background jobs.'),
   output_chars: z.number().int().min(200).max(50_000).optional().default(4_000).describe('Max output characters shown per call.'),
@@ -504,7 +504,7 @@ function isHeavyJob(job: Job): boolean {
   });
 }
 
-/** Pooled jobs share three bounded worker slots; at most one may be CPU-heavy. */
+/** Pooled jobs share bounded, pressure-aware slots; at most one may be CPU-heavy. */
 function enqueue(job: Job): void {
   queue.push(job);
   pump();
@@ -524,7 +524,8 @@ function markInternalJobFailure(job:Job,error:unknown):void {
 }
 
 function pump(): void {
-  while (runningPooled < MAX_CONCURRENT_JOBS && queue.length) {
+  const activeLimit=Math.min(MAX_CONCURRENT_JOBS,systemPressureStatus().suggestedSafeParallelism);
+  while (runningPooled < activeLimit && queue.length) {
     // Skip cancelled entries and allow lightweight work to pass a queued heavy
     // task that is waiting for the single heavy slot to become available.
     let index = -1;
@@ -1046,18 +1047,19 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
     const queued=batch.filter(job=>job.status==='queued').length;
     const completed=batch.filter(isFinished).length;
     const failed=batch.filter(job=>isFinished(job)&&job.status!=='succeeded').length;
+    const limit=Math.min(adaptive.effective,systemPressureStatus().suggestedSafeParallelism);
     observedPeakConcurrency=Math.max(observedPeakConcurrency,active);
-    const signature=[active,queued,completed,failed].join(':');
+    const signature=[active,queued,completed,failed,limit].join(':');
     if(signature!==lastProgress){
       lastProgress=signature;
       try{activity.parallel('jobs',group,{active,queued,completed,total:batch.length,
-        limit:adaptive.effective,peak:observedPeakConcurrency,failed});}catch{}
+        limit,peak:observedPeakConcurrency,failed});}catch{}
     }
     if(completed===batch.length)for(const job of batch)delete job.parallelProgress;
   };
   for(const job of batch)job.parallelProgress=publishProgress;
   publishProgress();
-  // Feed the shared scheduler: at most three workers globally, one CPU-heavy
+  // Feed the shared scheduler: up to six lightweight workers, one CPU-heavy
   // job at a time, and lightweight work can pass a queued heavy job.
   for (const job of batch) enqueue(job);
 
@@ -1110,7 +1112,7 @@ export function buildJobToolDefinitions(): ToolDefinition[] {
       name: 'run_parallel',
       description: [
         'Run independent tool calls/shell commands concurrently, or add explicit depends_on:[0,1] zero-based earlier indices for a bounded dependency-aware workflow. A dependent call runs ONLY after every predecessor succeeds. Failed or interrupted predecessors skip dependent commands and writes without execution.',
-        'Up to three workers run globally, but only one CPU-heavy command/build/check runs at a time; lightweight file reads continue while it runs.',
+        'Up to six lightweight workers run globally when CPU/RAM and load allow; moderate/high/critical pressure reduces admission to 3/2/1. Only one CPU-heavy command/build/check runs at a time.',
         'Use it for independent reads, file operations on separate paths, searches and lightweight checks.',
         'Heavy builds/tests/commands are serialized; lightweight reads can finish while a heavy job continues.',
         'Each item is {tool,args,depends_on?:number[]} or {command,cwd?,timeout_ms?,depends_on?:number[]}. Dependencies reference earlier array items only. No model, hidden retries, or invented arguments.',
@@ -1125,7 +1127,7 @@ export function buildJobToolDefinitions(): ToolDefinition[] {
       description: [
         'Start a background worker job on this device and return its id immediately.',
         'Use for work that takes longer than one call (builds, test suites, installs, long scripts) or to run several',
-        'workstreams: spawn one job per piece, then call wait_jobs. Up to three workers run globally; only one CPU-heavy job runs at a time, while light file work can continue. A job is either a single "command"',
+        'workstreams: spawn one job per piece, then call wait_jobs. Up to six hardware/load-adapted lightweight workers run globally; only one CPU-heavy job runs at a time. A job is either a single "command"',
         'or "steps": a list run in order, each {command, cwd?, timeout_ms?} or {tool, args} (e.g. edit_block then run tests).',
         'A failed step stops the job unless continue_on_error=true. Jobs are not limited by the 2-minute call timeout',
         `(default limit ${DEFAULT_JOB_TIMEOUT_MS / 60_000} min, max 6 h). Up to ${MAX_CONCURRENT_JOBS} jobs run at once; CPU-heavy jobs are serialized and light reads may run beside one heavy job.`,

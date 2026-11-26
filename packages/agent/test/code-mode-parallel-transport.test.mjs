@@ -46,21 +46,23 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    {name:'read_code_file',description:'Real source read behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'start_search',description:'Real blocking search behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'project_map',description:'Real bounded project map behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
+   {name:'code_graph',description:'Synthetic CPU-heavy operation for scheduler admission',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_parallel',description:'Bounded parallel DAG',inputSchema:{type:'object'}},
    {name:'run_command',description:'Explicit native command using normal job policies',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
    {name:'agent_status',description:'Live test status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'cancel_operation',description:'Cancel test operation',inputSchema:{type:'object'}}];
-  let active=0,peak=0,target=4,arrived=0,finished=new Set();
+  let active=0,peak=0,target=4,arrived=0,finished=new Set(),heavyActive=0,heavyPeak=0;
   const searches=[];
   let barrier;
-  function reset(count){target=count;arrived=0;peak=0;finished=new Set();barrier=new Promise(r=>{release=r;});}
+  function reset(count){target=count;arrived=0;peak=0;heavyPeak=0;finished=new Set();barrier=new Promise(r=>{release=r;});}
   reset(4);
   const executor=async(name,a)=>{
    if(name==='run_parallel')return handleRunParallel(a);
-   assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file'||name==='project_map');
+   assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file'||name==='project_map'||name==='code_graph');
    const signal=getCallContext()?.signal;
    if(a.depends)assert.ok(finished.has(a.depends),'dependent read started before its predecessor settled');
    active++;peak=Math.max(peak,active);arrived++;
+   if(name==='code_graph'){heavyActive++;heavyPeak=Math.max(heavyPeak,heavyActive);}
    if(arrived===target)release();
    try{
     await new Promise((resolve,reject)=>{
@@ -81,7 +83,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
     if(a.fail)return {isError:true,content:[{type:'text',text:'READ_FAILED'}],structuredContent:{error:{code:'READ_FAILED'}}};
     finished.add(a.token);
     return {content:[{type:'text',text:'read '+a.token}]};
-   }finally{active--;}
+   }finally{active--;if(name==='code_graph')heavyActive--;}
   };
   setJobToolExecutor(executor);
   relay=await buildRelay({port:0,host:'127.0.0.1',publicUrl:'http://127.0.0.1:3210',trustProxy:false,
@@ -159,6 +161,26 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
    assert.equal(peak,2);assert.equal(arrived,3);assert.ok(finished.has('c'));
    assert.equal(result.structuredContent.result.pending,false);
+  });
+  await t.test('default parallelSafe fanout executes six native file reads concurrently through MCP',async()=>{
+   reset(6);
+   const files=Array.from({length:6},(_,i)=>path.join(project,'six-'+i+'.txt'));
+   await Promise.all(files.map((file,i)=>fs.writeFile(file,'six-way-fixture-'+i)));
+   const source='const paths='+JSON.stringify(files)+';const r=await tools.parallelSafe(paths.map(path=>({tool:"read_file",args:{path}})));return {limit:r.structuredContent.effectiveConcurrency,texts:r.map(v=>v.text)};';
+   const result=await tool('code_mode',{source});
+   assert.equal(result.isError,false,JSON.stringify(result));assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   assert.equal(result.structuredContent.result.limit,6);assert.equal(peak,6);
+   for(const [i,value]of result.structuredContent.result.texts.entries())assert.match(value,new RegExp('six-way-fixture-'+i));
+   assert.ok(activity.recent().some(e=>e.level==='parallel'&&/PARALLEL JOBS.*active 6\/6/.test(e.message)));
+  });
+  await t.test('six worker slots still serialize CPU-heavy work beside five light reads',async()=>{
+   reset(6);
+   const calls=[{tool:'code_graph',args:{token:'heavy-a'}},
+    ...Array.from({length:5},(_,i)=>({tool:'read_file',args:{token:'light-'+i}})),
+    {tool:'code_graph',args:{token:'heavy-b'}}];
+   const result=await tool('code_mode',{source:'const r=await tools.parallelSafe('+JSON.stringify(calls)+');return r.structuredContent;'});
+   assert.equal(result.isError,false,JSON.stringify(result));assert.equal(result.structuredContent.allCallsSucceeded,true,JSON.stringify(result));
+   assert.equal(peak,6);assert.equal(arrived,7);assert.equal(heavyPeak,1);
   });
   await t.test('parallel counters update while real MCP child calls are still running',async()=>{
    reset(99);

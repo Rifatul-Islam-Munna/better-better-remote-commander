@@ -7,6 +7,8 @@ import {CODE_MODE_MAX_ADMITTED} from 'brc-shared';
 import { AgentError,failure } from '../runtime/errors.js';
 import { PluginAdmin } from './plugin-admin.js';
 import { isTermuxRuntime } from '../runtime/platform-capabilities.js';
+import {lightweightConcurrencyLimit} from '../runtime/parallel-capacity.js';
+import {systemPressureStatus} from '../runtime/system-pressure.js';
 import { boundedAgentFrame,recordResultFrameQueued } from './result-budget.js';
 import { connectionHealth } from './connection-health.js';
 import { ResultSpool } from './result-spool.js';
@@ -28,10 +30,10 @@ export class WsClient {
  private pongTimer?:NodeJS.Timeout;
  private reconnectTimer?:NodeJS.Timeout;
  private unauthorizedCount=0;
- private scheduler=new OperationScheduler(Math.min(3,Math.max(1,Number(process.env.BRC_MAX_CONCURRENCY)||(isTermuxRuntime()?2:3))),isTermuxRuntime()?16:32);
+ private scheduler=new OperationScheduler(Math.min(lightweightConcurrencyLimit(),Math.max(1,Number(process.env.BRC_MAX_CONCURRENCY)||(isTermuxRuntime()?2:lightweightConcurrencyLimit()))),isTermuxRuntime()?16:32,()=>systemPressureStatus().suggestedSafeParallelism);
  // Code Mode owns adaptive runnable/project admission internally. Keep a
  // separate bounded outer lane for cancellation/deadlines so parked workflows
- // do not occupy all three ordinary tool slots or block status/job recovery.
+ // do not occupy the ordinary tool slots or block status/job recovery.
  private codeModeCalls=new OperationScheduler(CODE_MODE_MAX_ADMITTED,CODE_MODE_MAX_ADMITTED);
  private seen=new Map<string,number>();
  private readonly log:NonNullable<WsClientOptions['log']>;

@@ -14,6 +14,7 @@ import type { PdfOperations, PdfMetadata } from './pdf/index.js';
 // BRC: the PDF stack (md-to-pdf/puppeteer, pdf-lib, unpdf) is heavy; load it on demand.
 const loadPdf = () => import('./pdf/index.js');
 import { isBinaryFile } from 'isbinaryfile';
+import { AgentError } from '../../runtime/errors.js';
 
 // CONSTANTS SECTION - Consolidate all timeouts and thresholds
 const FILE_OPERATION_TIMEOUTS = {
@@ -129,7 +130,7 @@ async function getAllowedDirs(): Promise<string[]> {
         // An empty list means explicitly unrestricted in the legacy config.
         // It must NEVER be returned because a policy read or write failed.
         // Do not put config or secret values into the error message.
-        throw new Error('PATH_POLICY_UNAVAILABLE: Cannot load allowed directories. Access denied until local configuration is repaired.');
+        throw new AgentError('PATH_POLICY_UNAVAILABLE','PATH_POLICY_UNAVAILABLE: Cannot load allowed directories. Access denied until local configuration is repaired.');
     }
 }
 
@@ -299,7 +300,10 @@ export async function validatePath(requestedPath: string): Promise<string> {
                 allowedDirsCount: (await getAllowedDirs()).length
             });
 
-            throw new Error(`Path not allowed: ${requestedPath}. Must be within one of these directories: ${(await getAllowedDirs()).join(', ')}`);
+            const linkedTarget=normalizePath(pathForNextCheck)!==normalizePath(absoluteOriginal);
+            throw new AgentError('PATH_NOT_ALLOWED',`Path not allowed: ${requestedPath}. `+
+                (linkedTarget?'Resolved symlink/junction target is outside configured allowed directories.':
+                    'Requested path is outside configured allowed directories.'));
         }
 
         // SECURITY: Always return the resolved path (with symlinks resolved) so that

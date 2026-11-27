@@ -55,6 +55,8 @@ export function failure(err: unknown, callId?: string): ToolResult {
     FILE_CONFLICT:'The expected_sha256 is stale, or the file changed before commit. No blind retry. Call read_code_file for the current SHA-256 and exact text, then submit a corrected edit after confirming the latest content.',
     STALE_SOURCE_OBSERVATION:'This workflow previously read the target, but it changed before mutation. Re-read the current source before editing; no mutation started.',
     PATH_CHANGED:'The file/junction resolved to a different location while waiting for a write lock. No tool operation started. Re-check the path and verify its canonical target before any new attempt.',
+    PATH_NOT_ALLOWED:'The path or its resolved symlink/junction target must be within configured allowed directories. Use an allowed location; retrying unchanged paths will not help. Any access change needs explicit local-owner authorization.',
+    PATH_POLICY_UNAVAILABLE:'The agent could not load its filesystem access policy and denied access. Repair local configuration before retrying; do not substitute unrestricted directories.',
     SOURCE_HASH_REQUIRED:'Strict source observations are enabled. Read the current source and supply expected_sha256 before editing an existing code/configuration file.',
     TOOL_OUTCOME_UNCERTAIN:'A mutating tool did not confirm that it stopped. Inspect actual effects before repeating work.',
     PLUGIN_CALL_OUTCOME_UNCERTAIN:'A plugin call may have executed before its connection failed. Check external state; never replay blindly.',

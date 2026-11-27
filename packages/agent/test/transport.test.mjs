@@ -37,6 +37,21 @@ test('real MCP coding workflow, cancellation and bounded live diagnostics',{time
  try{
   await until(()=>relay.hub.list().length===1);
   await rpc('initialize',{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'integration-test',version:'1'}});
+  await t.test('external dependency junction denial stays classified over real MCP',async st=>{
+   const store=path.join(dir,'dependency-store','next'),modules=path.join(project,'node_modules');
+   await fs.mkdir(path.join(store,'dist','docs'),{recursive:true});
+   await fs.mkdir(modules);
+   const direct=await tool('list_directory',{path:store});
+   assert.equal(direct.isError,true);
+   assert.equal(direct.structuredContent.error.code,'PATH_NOT_ALLOWED');
+   try{await fs.symlink(store,path.join(modules,'next'),process.platform==='win32'?'junction':'dir');}
+   catch(e){if(e.code==='EPERM'||e.code==='ENOTSUP'){st.skip('Directory links unavailable: '+e.code);return;}throw e;}
+   const denied=await tool('list_directory',{path:path.join(modules,'next','dist','docs'),depth:3,limit:120});
+   assert.equal(denied.isError,true);
+   assert.equal(denied.structuredContent.error.code,'PATH_NOT_ALLOWED');
+   assert.match(denied.structuredContent.error.message,/Resolved symlink\/junction target/);
+   assert.equal(denied.structuredContent.recovery.automaticRetry,false);
+  });
   await t.test('compact source pages retain editable hashes and cursors inside Code Mode over MCP',async()=>{
    const file=path.join(project,'large-source.ts'),source='// start\n'+'export const padding = "'+'A'.repeat(40000)+'";\n';
    await fs.writeFile(file,source);

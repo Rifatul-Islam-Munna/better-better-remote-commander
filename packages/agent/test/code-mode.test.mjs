@@ -65,6 +65,37 @@ test('focused discovery returns the actual schema plus a bounded TypeScript call
  assert.deepEqual(out.structuredContent.result,{name:'read_file',typed:true,schema:'string'});
 });
 
+test('logged object-shaped discovery and text output work without executing tools',async()=>{
+ const out=await executeCodeMode(args('const h=await tools.help();const s=await tools.search({query:"file"});text({topics:h.topics,names:s.map(x=>x.name)});'),catalog,async()=>{throw new Error('unexpected execution');});
+ assert.equal(out.isError,undefined,JSON.stringify(out));
+ assert.ok(out.structuredContent.result.topics.includes('errors'));
+ assert.deepEqual(out.structuredContent.result.names,['read_file','write_file']);
+ const single=await executeCodeMode(args('const h=await tools.help();text(h);'),catalog,async()=>text('unused'));
+ assert.equal(single.isError,undefined,JSON.stringify(single));
+ assert.ok(single.structuredContent.result.topics.includes('parallelism'));
+});
+
+test('text snapshots emissions, bounds output, and preserves explicit return values',async()=>{
+ const run=source=>executeCodeMode(args(source),[],async()=>{throw new Error('unexpected execution');});
+ const emitted=await run('const v={n:1};text(v);v.n=2;text(v);');
+ assert.deepEqual(emitted.structuredContent.result,[{n:1},{n:2}]);
+ const explicit=await run('text("preview");return {n:3};');
+ assert.deepEqual(explicit.structuredContent.result,{n:3});
+ for(const source of ['text("x".repeat(128001));','for(let i=0;i<65;i++)text(i);']){
+  const out=await run(source);
+  assert.equal(out.isError,true);
+  assert.match(out.structuredContent.error.message,/CODE_MODE_OUTPUT_LIMIT/);
+ }
+});
+
+test('search compatibility still rejects malformed or oversized query arguments',async()=>{
+ for(const query of [null,[],{},42,{query:42},{query:'x'.repeat(161)},{query:'file',limit:1}]){
+  const out=await executeCodeMode(args('await tools.search('+JSON.stringify(query)+');'),catalog,async()=>{throw new Error('unexpected execution');});
+  assert.equal(out.isError,true,JSON.stringify(out));
+  assert.equal(out.structuredContent.error.causeCode,'INVALID_ARGUMENT');
+ }
+});
+
 test('guest has no Node process, filesystem imports, require, fetch or global host APIs',async()=>{
  const out=await executeCodeMode(args([
    'return {process:typeof process,require:typeof require,fetch:typeof fetch,',

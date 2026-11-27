@@ -90,6 +90,12 @@ async function execute():Promise<unknown>{
     // Tools return a QuickJS Promise. The bridge resumes guest microtasks
     // after a local BRC tool completes; generated code uses await tools.call.
     const prelude=[
+      'const __brcOutput = []; let __brcOutputChars = 0;',
+      'const text = function(value) {',
+      ' const json = JSON.stringify(value) ?? "null";',
+      ' if (__brcOutput.length >= 64 || __brcOutputChars + json.length > 128000) throw new Error("CODE_MODE_OUTPUT_LIMIT: text() output exceeds 64 values or 128000 characters. Return a smaller summary.");',
+      ' __brcOutputChars += json.length; __brcOutput.push(JSON.parse(json));',
+      '};',
       'const __rpc = async function(request) {',
       ' const response = JSON.parse(await __brcCodeModeRpc(JSON.stringify(request)));',
       ' if (!response.ok) {',
@@ -103,8 +109,8 @@ async function execute():Promise<unknown>{
       ' const match = await __rpc({type:"workflow",name:"match",query});',
       ' if (!match || !match.found) return {matched:false};',
       ' const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;',
-      ' const fn = new AsyncFunction("tools","context",match.source);',
-      ' const value = await fn(tools,context);',
+      ' const fn = new AsyncFunction("tools","context","text",match.source);',
+      ' const value = await fn(tools,context,text);',
       ' return {matched:true,id:match.id,name:match.name,score:match.score,value};',
       '};',
       'const tools = Object.freeze({',
@@ -160,7 +166,11 @@ async function execute():Promise<unknown>{
       '});',
     ].join('\n');
 
-    const program='(async function(){\n"use strict";\n'+prelude+'\n'+input.source+'\n})()';
+    // Compatibility with hosts that emit results via text(). Explicit return
+    // values retain their existing meaning; otherwise return bounded emissions.
+    const program='(async function(){\n"use strict";\n'+prelude+
+      '\nconst __brcValue = await (async function(){\n'+input.source+'\n})();\n'+
+      'return __brcValue !== undefined ? __brcValue : __brcOutput.length === 1 ? __brcOutput[0] : __brcOutput.length ? __brcOutput : undefined;\n})()';
     const evaluation=vm.evalCode(program,'brc-code-mode.js');
     if(evaluation.error){
       const detail=vm.dump(evaluation.error) as {message?:unknown}|string;

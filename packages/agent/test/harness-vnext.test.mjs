@@ -517,7 +517,8 @@ test('tools.parallelSafe preflights the entire batch and explains denied statefu
     {tool:'get_more_search_results',args:{sessionId:'unused'}},
     {tool:'stop_search',args:{sessionId:'unused'}},
     {tool:'list_searches',args:{}},
-    {tool:'get_job',args:{id:'unused'}},
+    {tool:'wait_jobs',args:{ids:['unused']}},
+    {tool:'cancel_job',args:{ids:['unused']}},
     {tool:'write_file',args:{path:path.join(project,'never-created.txt'),content:'no'}},
   ];
   const catalog=[...new Set(['read_file','run_parallel',...denied.map(c=>c.tool)])].map(name=>({
@@ -527,7 +528,7 @@ test('tools.parallelSafe preflights the entire batch and explains denied statefu
   for(const call of denied){
     const source='await tools.parallelSafe('+JSON.stringify([{tool:'read_file',args:{path:path.join(project,'package.json')}},call])+');';
     const out=await executeCodeMode(args(source),catalog,async()=>{invoked++;return text('unexpected');});
-    assert.equal(out.isError,true,JSON.stringify(out));
+    assert.equal(out.isError,true,call.tool+': '+JSON.stringify(out));
     assert.match(out.content[0].text,/PARALLEL_SAFE_TOOL_DENIED/);
     assert.match(out.content[0].text,/No calls were started/);
     assert.match(out.content[0].text,/outer code_mode workflows/);

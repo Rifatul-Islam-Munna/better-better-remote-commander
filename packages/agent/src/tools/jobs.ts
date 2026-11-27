@@ -64,7 +64,7 @@ const CANCEL_SETTLE_GRACE_MS = Math.min(10_000,Math.max(100,Number(process.env.B
 export const JOB_TOOL_NAMES = new Set(['spawn_job', 'wait_jobs', 'get_job', 'list_jobs', 'cancel_job', 'run_parallel']);
 const FAST_PARALLEL_READS = new Set([
   'read_file','read_code_file','read_multiple_files','list_directory','get_file_info',
-  'git_status','git_diff','git_log','agent_status','list_sessions','get_more_search_results'
+  'git_status','git_diff','git_log','agent_status','list_sessions','get_more_search_results','get_job'
 ]);
 const PARALLEL_FILE_IO_TOOLS = new Set([
   'read_file','read_code_file','read_multiple_files','write_file','edit_block',
@@ -370,7 +370,7 @@ async function execStep(step: Step, signal: AbortSignal, remainingMs: number,
       { maxTimeoutMs: remainingMs, signal, failOnNonZero: true, onProgress },
     );
   }
-  if (JOB_TOOL_NAMES.has(step.tool)) return text(`Tool "${step.tool}" cannot be used inside a job.`, true);
+  if (JOB_TOOL_NAMES.has(step.tool)&&step.tool!=='get_job') return text(`Tool "${step.tool}" cannot be used inside a job.`, true);
   if (step.tool === 'run_command') {
     const a = step.args as Record<string, unknown>;
     const t = typeof a.timeout_ms === 'number' ? Math.min(a.timeout_ms, remainingMs) : remainingMs;
@@ -943,7 +943,7 @@ export async function handleGetJob(args: unknown): Promise<ServerResult> {
       ' bytes '+page.byteOffset+'..'+page.nextByteOffset+'/'+page.totalBytes+
       (result.spill.partial?' (retained output was size-capped)':'')+'\n'+page.text+
       (page.hasMore?'\n[MORE OUTPUT: call get_job with output_byte_offset='+page.nextByteOffset+']':'')}],
-      structuredContent:{jobId:j.id,step,byteOffset:page.byteOffset,
+      structuredContent:{jobId:j.id,status:j.status,pending:!isFinished(j),step,byteOffset:page.byteOffset,
         nextByteOffset:page.nextByteOffset,totalBytes:page.totalBytes,hasMore:page.hasMore,
         retainedOutputPartial:result.spill.partial, ...(next?{next}:{})}};
   }
@@ -956,7 +956,7 @@ export async function handleGetJob(args: unknown): Promise<ServerResult> {
       partial:x.spill!.partial})),
     storeCommandArguments:false,automaticJobReplay:false,
     note:'Large output retention is disabled by default unless explicitly requested or enabled in the local environment. Redaction is best effort; retained output can still contain sensitive data.'};
-  return {...answer,structuredContent:{jobId:j.id,status:j.status,steps:j.steps.length,
+  return {...answer,structuredContent:{jobId:j.id,status:j.status,pending:!isFinished(j),steps:j.steps.length,
     results:j.results.length,stepOffset:parsed.data.step_offset,
     hasMoreSteps:parsed.data.step_offset+parsed.data.step_limit<j.results.length,
     outputRetention:retention}};
@@ -1003,7 +1003,9 @@ export async function handleRunParallel(args: unknown): Promise<ServerResult> {
     'Invalid run_parallel arguments: '+parsed.error.message.slice(0,700),
     'Supply 1-50 independent calls containing {tool,args} or {command,cwd}. No tasks were started.');
   const a = parsed.data;
-  const bad = a.calls.find((s) => 'tool' in s && JOB_TOOL_NAMES.has(s.tool));
+  // A status/output read never starts, waits for, or cancels another job.
+  // Other job tools stay excluded to prevent recursive orchestration/deadlock.
+  const bad = a.calls.find((s) => 'tool' in s && JOB_TOOL_NAMES.has(s.tool) && s.tool!=='get_job');
   if (bad) return jobToolError('NESTED_JOB_TOOL',
     `Tool "${(bad as { tool: string }).tool}" cannot run inside run_parallel.`,
     'Call job-control tools separately; only independent ordinary tools or commands may be grouped. Nothing was started.');

@@ -90,7 +90,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
   },
   {
     name:'parallel_safe',
-    description:'Run independent verified reads, blocking start_search calls and explicit run_command calls through the normal bounded job scheduler. Commands retain command/path policy and CPU limits and may mutate; do not overlap competing writes. Omitted search wait defaults to true. Cursor/job-control tools and direct file mutations remain separate.',
+    description:'Run independent verified reads, get_job status/output reads, blocking start_search calls and explicit run_command calls through the normal bounded job scheduler. Commands retain command/path policy and CPU limits and may mutate; do not overlap competing writes. Omitted search wait defaults to true. Cursors, other job-control tools and direct file mutations remain separate.',
     inputSchema:{type:'object',required:['calls'],properties:{
       calls:{type:'array',minItems:1,maxItems:16,items:{type:'object',required:['tool','args'],properties:{
         tool:{type:'string'},args:{type:'object'},depends_on:{type:'array',items:{type:'integer',minimum:0}}
@@ -208,7 +208,7 @@ const CODE_MODE_VIRTUAL_TOOLS:ToolDefinition[]=[
 
 const PARALLEL_SAFE_STATEFUL_DENY=new Set([
   'get_more_search_results','stop_search','list_searches',
-  'get_job','wait_jobs','read_process_output','list_sessions','agent_status',
+  'spawn_job','wait_jobs','cancel_job','run_parallel','read_process_output','list_sessions','agent_status',
 ]);
 const MAX_TOOL_TEXT=36_000;
 const MAX_TOOL_RESPONSE=65_000;
@@ -672,10 +672,13 @@ export async function executeCodeMode(
       if(++discoveries>MAX_TOOL_DISCOVERY)
         return {ok:false,error:{code:'CODE_MODE_DISCOVERY_LIMIT',message:'Too many schema lookups.'}};
       if(request.type==='search'){
-        if(typeof request.query!=='string'||request.query.length>160)
-          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Search query must be a short string.'}};
-        const harnessIntent=/\b(?:help|features?|capabilities|semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip|parallel|pressure|heavy|worker|dag|worktree|coordination)\b/i.test(request.query);
-        return {ok:true,value:search(harnessIntent?discoveryCatalog:catalogView,request.query)};
+        const queryObject=request.query&&typeof request.query==='object'&&!Array.isArray(request.query)
+          ?request.query as Record<string,unknown>:null;
+        const query=queryObject&&Object.keys(queryObject).every(key=>key==='query')?queryObject.query:request.query;
+        if(typeof query!=='string'||query.length>160)
+          return {ok:false,error:{code:'INVALID_ARGUMENT',message:'Search query must be a string or {query:string}, at most 160 characters.'}};
+        const harnessIntent=/\b(?:help|features?|capabilities|semantic|workflow|snippet|specialist|agent|harness|trace|durable|retry|session|result|terminal|browser|fiber|roundtrip|parallel|pressure|heavy|worker|dag|worktree|coordination)\b/i.test(query);
+        return {ok:true,value:search(harnessIntent?discoveryCatalog:catalogView,query)};
       }
       const name=request.name;
       if(typeof name!=='string'||!discoverableNames.has(name))
@@ -744,6 +747,10 @@ export async function executeCodeMode(
       const resultBudget=Math.floor(24_000/safeCalls.length);
       const capture=(index:number,result:ToolResult)=>{
         const tool=String(safeCalls[index].tool);
+        const inspectedJobId=tool==='get_job'&&typeof result.structuredContent?.jobId==='string'
+          ?result.structuredContent.jobId:undefined;
+        if(inspectedJobId&&result.structuredContent?.pending===true&&!pendingJobs.includes(inspectedJobId))
+          pendingJobs.push(inspectedJobId);
         const metadataCompacted=limited(result.structuredContent,resultBudget/2+1).length>resultBudget/2;
         const structuredContent=metadataCompacted
           ?compactStructured(result.structuredContent,tool,Math.max(200,resultBudget-1000)):result.structuredContent;
@@ -751,11 +758,13 @@ export async function executeCodeMode(
           result.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
         const value={text:text.slice(0,Math.floor(resultBudget/2)),isError:!!result.isError,
           pending:result.structuredContent?.pending===true,structuredContent,
+          ...(inspectedJobId?{jobId:inspectedJobId}:{}),
           mediaOmitted:result.content.some(c=>c.type!=='text'),
           ...(metadataCompacted||text.length>Math.floor(resultBudget/2)||structuredContent?.outputTruncated===true?{outputTruncated:true}:{})};
         results[index]=limited(value,resultBudget+1).length<=resultBudget?value:{
           text:'Result exceeds the per-call budget. Inspect the job output or request a narrower read before deriving edits.',
           isError:!!result.isError,pending:result.structuredContent?.pending===true,outputTruncated:true,
+          ...(inspectedJobId?{jobId:inspectedJobId}:{}),
         };
       };
       const reply=await runToolCall('run_parallel',{
@@ -769,11 +778,12 @@ export async function executeCodeMode(
         const value=reply.value as Record<string,unknown>;
         const meta=value.structuredContent as Record<string,unknown>|undefined;
         const ids=Array.isArray(meta?.jobIds)?meta.jobIds:[];
-        const projectedResults=results.map((result,index)=>({...result,
-          index,tool:safeCalls[index].tool,
-          ...(result===null?{resultUnavailable:true,pending:meta?.pending===true}:{}),
-          ...(typeof ids[index]==='string'?{jobId:ids[index],next:{tool:'get_job',args:{id:ids[index]}}}:{}),
-        }));
+        const projectedResults=results.map((result,index)=>{
+          const jobId=safeCalls[index].tool==='get_job'&&typeof result?.jobId==='string'?result.jobId:ids[index];
+          return {...result,index,tool:safeCalls[index].tool,
+            ...(result===null?{resultUnavailable:true,pending:meta?.pending===true}:{}),
+            ...(typeof jobId==='string'?{jobId,next:{tool:'get_job',args:{id:jobId}}}:{})};
+        });
         // Do not mutate the reply referenced by the durable step ledger.
         parallelReply={...reply,value:{...value,results:projectedResults,
           parallelism:parallelFeedback(),

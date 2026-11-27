@@ -12,13 +12,14 @@ const parallelism = {
   commands:'Explicit {tool:"run_command",args:{program,args,cwd}} calls also work in parallelSafe and route through normal run_parallel command/path checks and resource limits. Commands may mutate; choose independent work and serialize competing writes. Direct run_parallel also supports commands and depends_on DAGs.',
   workflows:'The calling AI host may submit independent code_mode requests concurrently. Each has an isolated QuickJS worker, ledger and cancellation signal. BRC never spawns another AI model.',
   limits:{maxAdmitted:CODE_MODE_MAX_ADMITTED,maxRunnable:CODE_MODE_MAX_RUNNABLE,maxRunnablePerProject:3,maxSafeReadFanout:MAX_LIGHTWEIGHT_PARALLELISM,hardwareReadFanout:lightweightConcurrencyLimit(),adaptive:true},
-  ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts independent verified reads, blocking start_search (omitted wait defaults to true) and explicit run_command calls; it rejects explicit wait:false, direct file mutations, search cursors and job-control tools before starting any calls. depends_on:[0] refers to an earlier call.',
+  ordering:'Ordinary tools.call and specialist steps stay sequential. Do not Promise.all them inside one workflow. parallelSafe accepts independent verified reads, get_job status/output reads, blocking start_search (omitted wait defaults to true) and explicit run_command calls; it rejects explicit wait:false, direct file mutations, search cursors and other job-control tools before starting any calls. depends_on:[0] refers to an earlier call.',
   safety:'Await dependent reads before edits; serialize overlapping writes. Reduce fanout under pressure. Capacity is not a target worker count.',
   completion:'Inspect response.structuredContent, pending and actual exitCode. Follow get_job/wait_jobs for pending work; never rerun completed mutations to retrieve output.',
   liveConsole:'⚡ marks parallel calls. Live PARALLEL JOBS counters show active jobs, limit, queued, done and observed peak. CODE MODE counters show active/queued/parked workflows. These count scheduled jobs/workflows, not OS threads.',
 };
 const features = [
-  {api:'tools.search(query), tools.describe(name), tools.call(name,args)',use:'Discover exact schemas for permitted native and installed-plugin tools. Replies expose text, structuredContent, isError and pending.'},
+  {api:'tools.search(query), tools.describe(name), tools.call(name,args)',use:'Discover exact schemas for permitted native and installed-plugin tools. Search accepts a string or {query:string}, up to 160 characters. Replies expose text, structuredContent, isError and pending.'},
+  {api:'text(value)',use:'Emit JSON-compatible output without an explicit return. One emission returns its value; multiple return an array. An explicit non-undefined return takes precedence. Output is capped at 64 emissions and 128000 serialized characters.'},
   {api:'tools.call("read_code_file",{path,offset,length,maxChars}), tools.call("read_multiple_files",{paths,maxChars})',use:'Compact defaults: 12000 source characters / 32000 combined batch text. Source lives in structuredContent.text with sha256 and exact next cursor; follow next without restarting. Explicit larger budgets may produce result handles. Return only needed source/context, not duplicate full replies.'},
   {api:'tools.parallelSafe(calls,options)',use:'Bounded read/command DAGs with ordinary tool policies; see tools.help("parallelism").'},
   {api:'tools.semantic.search({path,query,offset,limit,preview_chars})',use:'Page local semantic/hybrid project retrieval; follow continuation.next. Retrieval is not compiler-semantic proof.'},
@@ -35,7 +36,7 @@ const features = [
   {api:'tools.call("spawn_job",...), tools.call("get_job",...), tools.call("wait_jobs",...)',use:'Start/follow long work; inspect actual completion. Recovery receipts do not authorize replay. Describe exact job schemas.'},
 ];
 const errors = {
-  PARALLEL_SAFE_TOOL_DENIED:'parallelSafe accepts blocking start_search and explicit run_command calls. Keep direct file mutations and cursor/job-control calls separate. No calls in the rejected batch were started; see tools.help("parallelism").',
+  PARALLEL_SAFE_TOOL_DENIED:'parallelSafe accepts get_job status/output reads, blocking start_search and explicit run_command calls. Keep direct file mutations, cursors and other job-control calls separate. No calls in the rejected batch were started; see tools.help("parallelism").',
   CODE_MODE_NESTED_PARALLEL_DENIED:'Use parallelSafe for eligible reads, run_parallel for independent operations, or concurrent outer code_mode calls. Ordinary tools.call/specialist runs stay sequential.',
   CODE_MODE_SCRIPT_FAILED:'Inspect returned JavaScript error and exact schemas. Replies use .text / .structuredContent; do not assume arbitrary fields.',
   EDIT_MISMATCH:'Re-read exact current source/hash. Correct unique anchors and whitespace; do not relax guards.',

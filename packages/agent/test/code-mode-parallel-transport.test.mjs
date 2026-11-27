@@ -27,7 +27,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   const {codeModeScheduler}=await import('../dist/runtime/code-mode-scheduler.js');
   const {activity}=await import('../dist/runtime/activity.js');
   const {buildCodeModeToolDefinitions}=await import('../dist/tools/code-mode-tools.js');
-  const {handleRunParallel,setJobToolExecutor}=await import('../dist/tools/jobs.js');
+  const {handleRunParallel,handleGetJob,handleSpawnJob,setJobToolExecutor}=await import('../dist/tools/jobs.js');
   const {rgPath}=await import('@vscode/ripgrep');
   const {handleStartSearch}=await import('../dist/core/handlers/search-handlers.js');
   const {handleReadFile}=await import('../dist/core/handlers/filesystem-handlers.js');
@@ -48,6 +48,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    {name:'project_map',description:'Real bounded project map behind a dispatch barrier',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'code_graph',description:'Synthetic CPU-heavy operation for scheduler admission',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_parallel',description:'Bounded parallel DAG',inputSchema:{type:'object'}},
+   {name:'get_job',description:'Real job status/output inspection',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'run_command',description:'Explicit native command using normal job policies',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
    {name:'agent_status',description:'Live test status',inputSchema:{type:'object'},annotations:{readOnlyHint:true}},
    {name:'cancel_operation',description:'Cancel test operation',inputSchema:{type:'object'}}];
@@ -58,6 +59,7 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
   reset(4);
   const executor=async(name,a)=>{
    if(name==='run_parallel')return handleRunParallel(a);
+   if(name==='get_job')return handleGetJob(a);
    assert.ok(name==='read_file'||name==='start_search'||name==='read_code_file'||name==='project_map'||name==='code_graph');
    const signal=getCallContext()?.signal;
    if(a.depends)assert.ok(finished.has(a.depends),'dependent read started before its predecessor settled');
@@ -124,6 +126,44 @@ test('Code Mode discovery, parallel workflows, read DAGs and cancellation traver
    assert.match(help.structuredContent.result.default,/Prefer parallel Code Mode/);
    assert.match(help.structuredContent.result.searches,/start_search/);
    assert.match(help.structuredContent.result.ordering,/omitted wait defaults to true/);
+  });
+  await t.test('logged search-object and text helper scripts succeed through MCP',async()=>{
+   const result=await tool('code_mode',{source:'const h=await tools.help();const s=await tools.search({query:"project context and parallel safe read tools"});text({topics:h.topics,names:s.map(x=>x.name)});'});
+   assert.equal(result.isError,false,JSON.stringify(result));
+   assert.ok(result.structuredContent.result.topics.includes('parallelism'));
+   assert.ok(result.structuredContent.result.names.includes('parallel_safe'));
+   const help=await tool('code_mode',{source:'const h=await tools.help();text(h);'});
+   assert.equal(help.isError,false,JSON.stringify(help));
+   assert.ok(help.structuredContent.result.topics.includes('features'));
+  });
+  await t.test('parallelSafe inspects real active/finished jobs without replay or false completion',async()=>{
+   try{
+   reset(99);
+   const started=await handleSpawnJob({steps:[{tool:'read_file',args:{token:'inspected-job'}}]});
+   const id=started.structuredContent.jobId;
+   await until(()=>arrived===1);
+   const pending=await tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"get_job",args:{id:'+JSON.stringify(id)+'}}]);return r.results[0];'});
+   assert.equal(pending.isError,false,JSON.stringify(pending));
+   assert.equal(pending.structuredContent.pending,true);
+   assert.equal(pending.structuredContent.executionCompleted,false);
+   assert.deepEqual(pending.structuredContent.pendingJobs,[id]);
+   assert.equal(pending.structuredContent.result.pending,true);
+   assert.equal(pending.structuredContent.result.jobId,id);
+   assert.equal(pending.structuredContent.result.next.args.id,id);
+   release();
+   await until(async()=> (await handleGetJob({id})).structuredContent.status==='succeeded');
+   reset(1);
+   const finished=await tool('code_mode',{source:'const r=await tools.parallelSafe([{tool:"read_file",args:{token:"mixed-read"}},{tool:"get_job",args:{id:'+JSON.stringify(id)+',output_chars:12000}}]);return r.results;'});
+   assert.equal(finished.isError,false,JSON.stringify(finished));
+   assert.equal(finished.structuredContent.allCallsSucceeded,true);
+   assert.equal(finished.structuredContent.executionCompleted,true);
+   assert.equal(finished.structuredContent.result[1].structuredContent.status,'succeeded');
+   assert.equal(finished.structuredContent.result[1].jobId,id);
+   assert.match(finished.structuredContent.result[0].text,/mixed-read/);
+   assert.equal(arrived,1,'inspection must not re-execute the original job');
+   }finally{
+    release();await until(()=>active===0);reset(4);
+   }
   });
   await t.test('four independent Code Mode workers overlap beyond the old transport cap',async()=>{
    const calls=Array.from({length:4},(_,i)=>tool('code_mode',{source:`const r=await tools.call("read_file",{token:${i}});return r.text;`}));
